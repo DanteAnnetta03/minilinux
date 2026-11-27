@@ -1,0 +1,181 @@
+================================================================================
+  MiniLinux 2.0 - Pending issues / known limitations
+================================================================================
+
+Lista viva. A medida que se cierran o aparecen, actualizar.
+NO documentar aca cosas ya resueltas y reflejadas en GUIA.txt.
+
+
+================================================================================
+  1. Fuente Monocraft en consola no se aplica
+================================================================================
+
+SINTOMA
+  Despues de boot la consola sigue en la fuente VGA 8x16 clasica, no en
+  Monocraft. 'setfont /usr/share/consolefonts/monocraft-7x16.psf' no
+  tiene efecto visible, incluso sin silenciarlo (no imprime error).
+
+CAUSA PROBABLE
+  El framebuffer no esta activo en la consola al momento que corre rcS.
+  La pila actual es:
+    - Kernel 6.14 con CONFIG_FB=y, FB_CORE=y, FB_SIMPLE=y, SYSFB=y,
+      SYSFB_SIMPLEFB=y, VT_CONSOLE=y, FRAMEBUFFER_CONSOLE=y.
+    - DRM_FBDEV_EMULATION NO esta (es decir, drivers DRM no crean /dev/fb0).
+    - Kernel 6.14 ya no honra 'vga=NNN' en cmdline a menos que se compile
+      FB_VESA (retirado).
+    - SeaBIOS por default arranca en modo VGA texto, sin pasar screen_info
+      con framebuffer al kernel.
+
+LO QUE YA PROBAMOS Y NO SIRVIO
+  - Agregar 'vga=788' al APPEND de isolinux.cfg.
+    (el kernel lo ignora sin FB_VESA built-in)
+  - Lanzar QEMU con '-vga virtio' (teniendo CONFIG_DRM_VIRTIO_GPU=y).
+    Sin DRM_FBDEV_EMULATION no se crea /dev/fb0, fbcon no arranca.
+  - 'sleep 1' antes del setfont en rcS por si fbcon tardaba.
+
+OPCIONES DE FIX PARA PROBAR
+
+  OPCION B (la mas robusta, implica rebuild de kernel ~40 min en esta
+            maquina):
+    Activar CONFIG_DRM_FBDEV_EMULATION=y. Despues cualquier driver DRM
+    (virtio, bochs, simpledrm) crea /dev/fb0 automaticamente, fbcon
+    toma el relevo, setfont funciona.
+    Comando:
+      sed -i 's|^# CONFIG_DRM_FBDEV_EMULATION is not set|CONFIG_DRM_FBDEV_EMULATION=y|' \
+          $MLX_STAGE/linux-6.14/.config
+      make ARCH=x86 olddefconfig
+      make ARCH=x86 CROSS_COMPILE=$CROSS -j$(nproc) bzImage
+    Despues reempaquetar initramfs + rebuild ISO. Y testear con:
+      qemu-system-i386 -cdrom build/minilinux.iso -m 512 -vga virtio ...
+
+  OPCION B2 (alternativa a B, tambien rebuild):
+    Activar DRM_SIMPLEDRM=y. Es un driver DRM "simple" que binda al
+    framebuffer firmware-provided (SYSFB). Combinado con
+    DRM_FBDEV_EMULATION da /dev/fb0 sin necesidad de virtio-gpu.
+
+  OPCION C (hack, sin rebuild):
+    Usar un bootloader mas completo (ej: GRUB2) que sepa setear un VBE
+    mode antes de pasarle control al kernel. Isolinux/vesamenu no
+    parece hacerlo con nuestro kernel 6.14.
+
+  OPCION D (aceptar):
+    No tocar nada. VGA 8x16 funciona perfectamente, todos los comandos
+    corren igual, el PS1 tiene colores, nano/joe renderizan. Monocraft
+    era puramente estetico.
+
+QUE HAY QUE HACER SI SE DEJA EL SETFONT COMENTADO
+  En $MLX_ROOTFS/etc/init.d/rcS, comentar la linea:
+    # setfont /usr/share/consolefonts/monocraft-7x16.psf
+  Y tambien el 'sleep 1' que la precede, para no demorar el boot al pedo.
+  O mejor: dejar un check de /dev/fb0 que solo intente si existe:
+    [ -e /dev/fb0 ] && setfont /usr/share/consolefonts/monocraft-7x16.psf
+
+ESTADO: PENDIENTE DECIDIR OPCION (recomendado OPCION B cuando haya tiempo).
+
+
+================================================================================
+  2. tcc tiene el ELF interpreter de ARM cocido en el binario
+================================================================================
+
+SINTOMA
+  Los binarios que tcc produce dentro de MiniLinux declaran como
+  interpreter '/lib/ld-musl-arm.so.1' (!), no '/lib/ld-musl-i386.so.1'.
+  Sin un hack, al ejecutarlos: "cannot execute: required file not found".
+
+CAUSA
+  Al configurar tcc con --triplet=i486-linux-musl + --cpu=i386 +
+  --cross-prefix, la logica de armado del interpreter path quedo mal.
+  tcc eligio el default ARM, probablemente por un bug/misconfig de
+  nuestro build.
+
+WORKAROUND ACTUAL
+  Symlink /lib/ld-musl-arm.so.1 -> libc.so (feo pero funciona porque el
+  loader de musl es arch-agnostic: el mismo binario sirve para cualquier
+  arch, hace el chequeo de ELF al abrir).
+
+FIX REAL (para v2.1)
+  Rebuildear tcc pasando -DCONFIG_TCC_ELFINTERP='"/lib/ld-musl-i386.so.1"'
+  via extra-cflags, o editar tcc source (tccelf.c) para que el default
+  interpreter sea el correcto.
+  Comando aproximado (verificar antes de correr):
+    make clean -C $MLX_STAGE/tcc-0.9.27
+    cd $MLX_STAGE/tcc-0.9.27
+    ./configure --prefix=/usr --cpu=i386 --cc=$CC --ar=$AR --strip=$STRIP \
+        --triplet=i486-linux-musl --config-musl \
+        --extra-cflags='-static -DCONFIG_TCC_ELFINTERP=\"/lib/ld-musl-i386.so.1\"' \
+        --extra-ldflags='-static'
+    make cross-i386
+  Reemplazar /usr/bin/tcc.bin en el rootfs.
+  Despues del fix, remover el symlink /lib/ld-musl-arm.so.1.
+
+ESTADO: WORKAROUND ACTIVO, FIX PENDIENTE.
+
+
+================================================================================
+  3. Red no funciona (eth0 down, DHCP falla, dropbear no acepta conexiones)
+================================================================================
+
+SINTOMA
+  Desde adentro del MiniLinux:
+    - 'ifconfig eth0' probablemente no muestra la interfaz up con IP.
+    - 'ping 1.1.1.1' falla.
+    - Desde el host:
+        ssh -p 2222 mux@localhost       -> rechaza o cuelga
+        curl http://localhost:8080      -> sin respuesta
+
+CAUSAS POSIBLES (a chequear en orden)
+  a) No se cargo driver e1000 ni virtio-net. Verificar en runtime:
+       ls /sys/class/net/           # aparece eth0?
+       dmesg | grep -iE 'e1000|virtio|eth'
+     Si no aparece eth0, el driver no quedo built-in en el kernel.
+
+  b) eth0 existe pero rcS no lo levanto. Verificar:
+       cat /etc/init.d/network
+       ps | grep -E 'udhcpc|network'
+     Puede haber un error silencioso porque en rcS redirigimos todo a
+     /dev/null. Probar start manual desde adentro:
+       /etc/init.d/network start
+     y ver si muestra errores.
+
+  c) udhcpc esta y pide lease pero QEMU SLiRP (user networking) no le
+     responde como esperamos. Setear IP estatica para test:
+       ifconfig eth0 10.0.2.15 netmask 255.255.255.0
+       route add default gw 10.0.2.2
+       echo 'nameserver 10.0.2.3' > /etc/resolv.conf
+     (10.0.2.x es el rango default de SLiRP)
+
+  d) El default script de udhcpc no esta instalado.
+     Busybox udhcpc necesita /usr/share/udhcpc/default.script para
+     aplicar la config que le llega del server. Verificar:
+       ls /usr/share/udhcpc/default.script
+     Si no existe, hay que crearlo (o copiarlo del source de busybox
+     en examples/udhcp/simple.script).
+
+  e) dropbear no se lanzo porque no llego a generar las host keys.
+     Verificar:
+       ls /etc/dropbear/
+       ps | grep dropbear
+
+QUE PROBAMOS Y CONFIRMAMOS QUE NO ES EL PROBLEMA
+  - El kernel tiene CONFIG_NET, INET, PACKET, UNIX, E1000, VIRTIO_NET,
+    E1000E habilitados (segun .config final).
+  - busybox trae udhcpc, ifconfig, route, dropbear.
+  - QEMU se lanza con -netdev user,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:80
+    -device e1000,netdev=n0.
+
+PROXIMO PASO SUGERIDO
+  Bootear MiniLinux con -serial mon:stdio en QEMU (asi vemos kernel log
+  por serial), despues loguear y correr:
+    dmesg | tail -40
+    ifconfig -a
+    cat /proc/net/dev
+    /etc/init.d/network start
+    ls /usr/share/udhcpc/default.script
+  Y con ese output decidir si es (a), (d) o algo distinto.
+
+ESTADO: BLOQUEANTE PARA USAR LA FEATURE DE TRANSFERENCIA. PENDIENTE DEBUG.
+
+
+================================================================================
+  4. [agregar mas items aca a medida que aparezcan]
+================================================================================

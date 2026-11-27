@@ -1,0 +1,1187 @@
+================================================================================
+  MiniLinux 2.0 - Documento de Arquitectura
+================================================================================
+
+Este documento NO es la guía de build. Es el plano que vamos a discutir antes
+de tocar una línea. Cada sección responde a "qué es", "por qué está" y "cómo
+se relaciona con lo demás". Cuando lo apruebes (con los cambios que quieras),
+escribimos la guía paso a paso.
+
+
+================================================================================
+  ÍNDICE
+================================================================================
+
+  0. Filosofía y restricciones de diseño
+  1. Fundamentos de Linux que vas a usar en este proyecto
+     1.1 Qué es "un Linux" en realidad
+     1.2 El arranque de un PC x86 (BIOS -> MBR -> bootloader -> kernel -> init)
+     1.3 Kernel space vs user space, y la frontera entre ambos
+     1.4 Filesystem Hierarchy Standard (FHS): el "mapa" de /
+     1.5 initramfs vs initrd vs rootfs real
+     1.6 libc: por qué musl y no glibc
+     1.7 Linkado estático vs dinámico
+     1.8 Cross-compilation: qué, por qué y cómo
+     1.9 ISO9660 e ISOLINUX
+  2. Arquitectura general de MiniLinux 2.0
+     2.1 Diagrama del flujo de boot
+     2.2 Layout del ISO
+     2.3 Layout del initramfs (= rootfs en RAM)
+  3. Catálogo de paquetes
+     3.1 Kernel linux 6.14
+     3.2 musl (viene con i486-linux-musl-cross)
+     3.3 busybox 1.36
+     3.4 ncurses 6.4
+     3.5 bash 5.2
+     3.6 nano 7.x
+     3.7 joe 4.x
+     3.8 tcc 0.9.27
+     3.9 kernel headers + musl headers (para compilar DENTRO del sistema)
+     3.10 lua 5.4
+     3.11 micropython
+     3.12 dropbear 2024.x
+     3.13 rsync 3.2.x
+     3.14 syslinux / isolinux
+  4. Jerarquía del rootfs final
+  5. Scripts y configuraciones del sistema (línea por línea)
+  6. Flujo de build de alto nivel
+  7. Herramientas del host Ubuntu que vas a necesitar
+  8. Preguntas abiertas para decidir antes de arrancar
+
+
+================================================================================
+  0. FILOSOFÍA Y RESTRICCIONES DE DISEÑO
+================================================================================
+
+Reglas duras (si rompemos una, rompemos la escala del proyecto):
+
+  R1. Todo userland se compila ESTÁTICO contra musl.
+      -> ningún binario depende de .so externos. No hay ldd ni dynamic linker.
+
+  R2. Ninguna librería compartida en el rootfs (salvo ncurses como .a).
+      -> cada ejecutable se auto-contiene.
+
+  R3. Nada que arrastre glibc, openssl, python-completo, perl, zlib dinámica.
+      -> esas son las puertas de entrada al "dependency hell".
+
+  R4. El rootfs vive en RAM (initramfs). Nada se persiste sin pedirlo
+      explícitamente (mount /dev/sdX /mnt).
+      -> boot reproducible siempre, como un live CD.
+
+  R5. El bootloader es ISOLINUX, el filesystem del ISO es ISO9660+Rock Ridge.
+      -> estándar, probado, y syslinux-utils te deja hacer isohybrid para USB.
+
+Objetivos:
+  - Escribir código (editar + compilar) sin salir del sistema.
+  - Scripting cómodo (bash + lua + micropython).
+  - Red funcional al boot, con DHCP y SSH entrantes.
+  - Transferencia de archivos bidireccional vía scp, rsync, http y nc.
+  - ISO de ~16 MB, booteable en QEMU y en PC real (vía isohybrid -> USB).
+
+
+================================================================================
+  1. FUNDAMENTOS DE LINUX QUE VAS A USAR
+================================================================================
+
+1.1 Qué es "un Linux" en realidad
+---------------------------------
+Lo que llamamos "Linux" son en realidad TRES cosas apiladas:
+
+  (a) El KERNEL: un único archivo ejecutable (bzImage) que, una vez cargado
+      en memoria, gestiona CPU, memoria, procesos, dispositivos, red y
+      filesystems. Expone servicios a los programas mediante SYSCALLS (int 0x80
+      o syscall en x86_64).
+
+  (b) El USERLAND: todo lo demás. Shell, utilidades, servicios, editores,
+      compiladores. Son binarios normales que piden cosas al kernel vía syscalls.
+      BusyBox, bash, nano, etc. son userland.
+
+  (c) El init (PID 1): el PRIMER proceso que el kernel ejecuta. Es un programa
+      de userland cuyo trabajo es montar filesystems, levantar servicios y
+      quedarse vivo mientras el sistema funcione. Si muere, kernel panic.
+
+Una distro es un árbol de archivos en disco + un bootloader que le dice al
+BIOS cómo cargar el kernel y pasarle los parámetros correctos.
+
+
+1.2 El arranque de un PC x86 (modo BIOS clásico)
+------------------------------------------------
+Secuencia, de cero a prompt:
+
+  [1] POST + BIOS
+      La placa ejecuta firmware de la ROM. Inicializa hardware mínimo y busca
+      medios booteables en el orden configurado.
+
+  [2] MBR (primeros 512 bytes del medio) o ISOLINUX boot sector
+      El BIOS carga esos 512 bytes en 0x7C00 y les salta. En un ISO con
+      ISOLINUX, es el boot record del "El Torito" el que se carga.
+
+  [3] Bootloader (ISOLINUX en nuestro caso)
+      Lee su propio config (isolinux.cfg), muestra menú si está configurado,
+      carga en memoria:
+        - el kernel (bzImage)
+        - el initramfs (rootfs.cpio.xz)
+        - le pasa la línea de comando (cmdline) al kernel
+
+  [4] Kernel se descomprime y arranca
+      El bzImage es en realidad: (setup code pequeño) + (vmlinux comprimido).
+      El setup prepara protected mode, descomprime vmlinux en RAM, le salta.
+      El kernel detecta CPU, memoria, PCI, devices, inicializa drivers que
+      estén compilados dentro (no hay módulos en nuestro build).
+
+  [5] Montaje del initramfs
+      Como está compilado con BLK_DEV_INITRD=y y le pasamos initrd=... en
+      la cmdline (o ISOLINUX usa INITRD), el kernel descomprime el cpio.xz
+      en una tmpfs llamada rootfs y lo monta como /.
+
+  [6] Ejecuta rdinit (o init)
+      Si en cmdline dice rdinit=/sbin/init, corre ESE binario. Si no, prueba
+      /sbin/init, /etc/init, /bin/init, /bin/sh en ese orden.
+      Ese proceso es PID 1. Si termina, kernel panic.
+
+  [7] /sbin/init (en nuestro caso, un script o busybox init)
+      Lee /etc/inittab si usamos busybox init, o si es un script, ejecuta
+      paso a paso: monta /proc /sys /dev /tmp, pobla /dev con mdev, levanta
+      red, arranca dropbear, abre consolas (getty) o lanza directamente shell.
+
+Tu floppinux actual salta el paso 7 "formal" y usa un script en
+/etc/init.d/rc como rdinit. Es válido pero no escala bien a múltiples
+servicios. En 2.0 vamos a usar /sbin/init de busybox con /etc/inittab.
+
+
+1.3 Kernel space vs user space
+------------------------------
+  - Kernel space: código del kernel, drivers, syscall handlers. Corre en
+    ring 0 (x86). Accede a todo el hardware.
+  - User space: tus programas. Corren en ring 3. NO acceden a hardware
+    directo; piden al kernel vía syscalls (read, write, open, mmap, fork,
+    execve, etc.) definidas en <unistd.h>.
+
+El PUENTE entre ambos lo pone LA LIBC (musl en nuestro caso). musl traduce
+"open()" en C a la syscall correcta, maneja errno, etc. Sin libc igual se
+puede programar (haciendo syscalls a mano con asm), pero es masoquismo.
+
+
+1.4 Filesystem Hierarchy Standard (FHS)
+---------------------------------------
+Linux tiene un árbol de directorios estandarizado. No todos son obligatorios
+en un sistema mínimo. Los que SÍ vamos a usar y por qué:
+
+  /bin        Binarios esenciales accesibles antes de montar /usr.
+              Ej: sh, ls, cat, mount. En sistemas modernos suele ser un
+              symlink a /usr/bin (merged-usr). Nosotros vamos merged-usr:
+              /bin -> /usr/bin, /sbin -> /usr/sbin, /lib -> /usr/lib.
+              Simplifica todo.
+
+  /sbin       Binarios de administración (init, mount, ifconfig, mdev).
+
+  /usr/bin    Binarios "no esenciales" (en origen histórico).
+  /usr/sbin   Idem para admin.
+  /usr/lib    Librerías. En nuestro caso casi vacío (todo es estático).
+  /usr/share  Datos legibles arquitectura-independiente (terminfo, man, etc.).
+  /usr/include Headers de C para compilar.
+
+  /etc        Configuración del sistema. Texto plano.
+              inittab, fstab, profile, hostname, hosts, resolv.conf,
+              init.d/, dropbear/, etc.
+
+  /dev        Nodos de dispositivo (character/block devices).
+              Con DEVTMPFS_MOUNT=y el kernel lo monta solo con los nodos
+              básicos. mdev de busybox llena el resto.
+
+  /proc       Filesystem virtual: info del kernel y procesos en runtime.
+              NO vive en disco. Se monta: mount -t proc proc /proc.
+
+  /sys        Filesystem virtual: info de dispositivos y buses.
+              mount -t sysfs sysfs /sys.
+
+  /tmp        Scratch space. tmpfs, en RAM.
+
+  /var        Datos variables en runtime (logs, lock files, cache).
+              /var/log, /var/run (o /run), /var/www para httpd.
+
+  /root       Home del usuario root.
+
+  /home       Homes de usuarios normales.
+
+  /mnt, /media Puntos de montaje para medios externos.
+
+Regla práctica: si no sabés dónde poner algo, el Filesystem Hierarchy
+Standard (man hier) tiene la respuesta.
+
+
+1.5 initramfs vs initrd vs rootfs real
+--------------------------------------
+Tres conceptos que confunden:
+
+  initrd (viejo): una IMAGEN de filesystem (ext2, romfs) cargada en RAM
+    como un ramdisk (/dev/ram0). El kernel la monta y después se espera
+    a que el init haga pivot_root al rootfs real en disco.
+
+  initramfs (moderno): un CPIO comprimido (gz, xz, zstd) que el kernel
+    extrae en una tmpfs llamada "rootfs". No es un filesystem con bloques;
+    son archivos vivos en tmpfs. Mucho más flexible.
+
+  rootfs real: cuando el initramfs hace "switch_root" a un filesystem en
+    disco. En nuestro caso NO HACEMOS ESTO. Nos quedamos corriendo en el
+    initramfs permanentemente: ese ES nuestro rootfs.
+
+Por eso en cmdline vamos a pasar rdinit=/sbin/init y no root=/dev/sdX.
+
+
+1.6 libc: por qué musl y no glibc
+---------------------------------
+  glibc: la libc de GNU. Enorme, complicada, hecha para sistemas
+    full-fledged. Linkado estático con glibc es oficialmente desaconsejado
+    y arrastra pedazos de 5+ MB por un "hello world".
+
+  musl: libc ligera, con foco en static linking limpio. Un "hello world"
+    estático pesa ~5 KB. Compatible con estándar C y POSIX. Tu toolchain
+    i486-linux-musl-cross usa musl.
+
+  uclibc-ng: otra alternativa, histórica, hoy menos activa.
+
+Con musl, un binario estático es verdaderamente portable: lo copiás a
+cualquier kernel Linux 32-bit y corre, sin libc instalada en el sistema.
+
+
+1.7 Linkado estático vs dinámico
+--------------------------------
+Dinámico (típico de distros grandes):
+  - El binario referencia libs externas (.so).
+  - En runtime, el dynamic linker (/lib/ld-linux.so.2) carga las libs.
+  - Ventaja: compartís memoria entre procesos y ahorrás disco.
+  - Desventaja: cualquier binario necesita que SU versión de la lib esté
+    presente. "dll hell" también existe en Linux.
+
+Estático:
+  - Todo el código de las libs queda COPIADO adentro del binario.
+  - Un solo archivo, no depende de nada externo.
+  - Ventaja: portabilidad absoluta, boot simple, debug sencillo.
+  - Desventaja: binarios más grandes, actualizar la libc obliga a recompilar
+    todo.
+
+Para un sistema minimalista, el estático gana. 1 MB extra en 10 binarios
+(10 MB total) es trivial comparado con la complejidad de mantener un
+sistema dinámico desde cero.
+
+Flags típicos de configure para forzar estático:
+  LDFLAGS="-static"
+  CFLAGS="-static"
+  --enable-static --disable-shared
+
+Algunos paquetes tienen flags propios (bash: --enable-static-link).
+
+
+1.8 Cross-compilation
+---------------------
+Compilar en tu Ubuntu moderno x86_64 un binario que correrá en el
+MiniLinux i486 32-bit.
+
+Una toolchain cross se identifica por un "triplet": arquitectura-sistema-libc.
+  i486-linux-musl: CPU i486, kernel Linux, libc musl.
+
+El cross-toolchain trae su propio gcc, ld, ar, strip, etc., todos con
+prefijo: i486-linux-musl-gcc, i486-linux-musl-ld, etc.
+
+Flags típicos:
+  CC=i486-linux-musl-gcc
+  CROSS_COMPILE=i486-linux-musl-   (convención del kernel y busybox)
+  --host=i486-linux-musl           (convención de autotools)
+
+El compilador cross sabe que debe generar código i486, linkar contra la
+musl de SU sysroot, y buscar headers en SU sysroot. Por eso el sysroot
+del cross-toolchain es la "cebolla" donde ya viven musl headers y libs.
+
+En tu caso el toolchain está en /home/dante/mini_linux/i486-linux-musl-cross.
+Las libs y headers ya vienen dentro (probablemente en
+i486-linux-musl-cross/i486-linux-musl/).
+
+
+1.9 ISO9660 e ISOLINUX
+----------------------
+ISO9660: filesystem originalmente para CDs. Read-only, nombres cortos
+  (8.3). Las extensiones Rock Ridge permiten nombres largos y permisos
+  Unix; Joliet permite nombres largos para Windows. Vamos a usar
+  ISO9660 + Rock Ridge.
+
+El Torito: estándar que permite que una ISO sea booteable en BIOS.
+  Reserva un "boot image" que el BIOS carga como si fuera un floppy.
+
+ISOLINUX: el componente de syslinux que actúa como bootloader dentro
+  de un ISO El Torito. Es básicamente el mismo SYSLINUX que ya usás,
+  pero con un boot sector adaptado al ISO.
+
+xorriso / mkisofs / genisoimage: herramientas que arman el ISO.
+  xorriso es la moderna, flexible y mantenida. Vamos con xorriso.
+
+isohybrid: post-procesa el ISO para que también sea booteable
+  como USB (el BIOS lo ve como disco y encuentra MBR válido).
+
+
+================================================================================
+  2. ARQUITECTURA GENERAL DE MiniLinux 2.0
+================================================================================
+
+2.1 Diagrama del flujo de boot
+------------------------------
+
+  BIOS
+   |
+   v
+  ISO (El Torito) -> isolinux.bin
+   |
+   v
+  ISOLINUX lee isolinux.cfg
+   |
+   v
+  carga bzImage + rootfs.cpio.xz + cmdline
+   |
+   v
+  kernel se descomprime, inicializa drivers (consola, PCI, e1000, virtio-net,
+                                              iso9660, tmpfs, ext2/4...)
+   |
+   v
+  kernel descomprime rootfs.cpio.xz en tmpfs (rootfs)
+   |
+   v
+  ejecuta /sbin/init (busybox init)
+   |
+   v
+  busybox init lee /etc/inittab:
+      sysinit::/etc/init.d/rcS   (monta /proc /sys, mdev, red, dropbear)
+      ::respawn:/sbin/getty 38400 tty1
+      ::ctrlaltdel:/sbin/reboot
+      ::shutdown:/etc/init.d/rcK
+   |
+   v
+  getty abre tty1, ejecuta login (o shell directo)
+   |
+   v
+  prompt bash con red, SSH escuchando, httpd listo
+
+2.2 Layout del ISO
+------------------
+
+  minilinux.iso
+    |-- isolinux/
+    |     |-- isolinux.bin        (bootloader, de syslinux)
+    |     |-- ldlinux.c32         (modulo requerido por ISOLINUX 6)
+    |     |-- isolinux.cfg        (menu y cmdline)
+    |     |-- bzImage             (el kernel)
+    |     |-- rootfs.cpio.xz      (el initramfs)
+    |     |-- splash.txt          (banner opcional)
+    |
+    |-- boot/                     (opcional, para orden alternativo)
+
+Nota: ISOLINUX 6.x requiere que ldlinux.c32 y libutil.c32 estén junto a
+isolinux.bin. Es una trampa común.
+
+2.3 Layout del initramfs
+------------------------
+
+  rootfs/  (se empaqueta a cpio.xz)
+    |-- bin -> usr/bin
+    |-- sbin -> usr/sbin
+    |-- lib -> usr/lib
+    |-- dev/            (vacío al empaquetar; devtmpfs lo llena en boot)
+    |-- etc/
+    |     |-- inittab
+    |     |-- fstab
+    |     |-- profile
+    |     |-- hostname
+    |     |-- hosts
+    |     |-- resolv.conf
+    |     |-- motd
+    |     |-- passwd
+    |     |-- group
+    |     |-- shadow
+    |     |-- shells
+    |     |-- init.d/
+    |     |     |-- rcS
+    |     |     |-- rcK
+    |     |     |-- network
+    |     |     |-- dropbear
+    |     |-- dropbear/     (host keys generados al primer boot)
+    |     |-- terminfo/     (symlink a /usr/share/terminfo)
+    |-- home/
+    |-- mnt/
+    |-- opt/
+    |-- proc/
+    |-- root/
+    |-- run/
+    |-- sys/
+    |-- tmp/
+    |-- usr/
+    |     |-- bin/          (busybox + bash + nano + joe + tcc + lua +
+    |     |                  micropython + dropbear tools + rsync + ...)
+    |     |-- sbin/         (init -> busybox, ifconfig, udhcpc, dropbear, ...)
+    |     |-- lib/          (vacío en runtime)
+    |     |-- include/      (kernel headers + musl headers para tcc)
+    |     |-- share/
+    |           |-- terminfo/  (entradas: linux, xterm, xterm-256color, vt100)
+    |           |-- lua/
+    |-- var/
+          |-- log/
+          |-- www/          (htdocs para httpd)
+
+
+================================================================================
+  3. CATÁLOGO DE PAQUETES
+================================================================================
+
+Cada entrada incluye: qué hace, de dónde lo sacamos, dependencias de BUILD
+en el host, dependencias en el TARGET, flags principales, tamaño esperado,
+y cómo lo instalamos en el rootfs.
+
+
+3.1 Kernel linux 6.14
+---------------------
+QUÉ HACE: el corazón del sistema. Gestiona procesos, memoria, I/O, red,
+  filesystems, drivers. Lo compilamos como un único bzImage, con todo lo
+  esencial built-in (no módulos .ko).
+
+ORIGEN: ya lo tenés en /home/dante/mini_linux/linux. Si querés limpio:
+  https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.tar.xz
+
+DEPS DE HOST para compilarlo (Ubuntu):
+  build-essential, bc, bison, flex, libelf-dev, libssl-dev, libncurses-dev
+  (para menuconfig).
+
+DEPS DE TARGET: ninguna, es el kernel.
+
+CONFIG DIFF vs tu .config actual (cosas que vamos a ACTIVAR):
+  CONFIG_DEVTMPFS=y              # /dev lo gestiona el kernel
+  CONFIG_DEVTMPFS_MOUNT=y        # se auto-monta en /dev
+  CONFIG_TMPFS=y                 # fs en RAM para /tmp /run
+  CONFIG_TMPFS_POSIX_ACL=n       # no lo necesitamos
+  CONFIG_NET=y
+  CONFIG_PACKET=y                # raw sockets, dhcp los usa
+  CONFIG_UNIX=y                  # unix domain sockets
+  CONFIG_INET=y
+  CONFIG_IP_PNP=y                # opcional, DHCP desde kernel
+  CONFIG_E1000=y                 # NIC default de QEMU
+  CONFIG_VIRTIO=y
+  CONFIG_VIRTIO_PCI=y
+  CONFIG_VIRTIO_NET=y
+  CONFIG_ISO9660_FS=y
+  CONFIG_JOLIET=y
+  CONFIG_ZISOFS=y
+  CONFIG_EXT4_FS=y               # para montar usb/discos externos
+  CONFIG_VFAT_FS=y               # idem
+  CONFIG_NLS_CODEPAGE_437=y
+  CONFIG_NLS_ISO8859_1=y
+  CONFIG_NLS_UTF8=y
+  CONFIG_SERIAL_8250=y           # salida por ttyS0 (debug)
+  CONFIG_SERIAL_8250_CONSOLE=y
+  CONFIG_EPOLL=y                 # dropbear lo usa
+  CONFIG_INOTIFY_USER=y          # no esencial, pero útil
+  CONFIG_SIGNALFD=y, TIMERFD=y, EVENTFD=y   # idem
+  CONFIG_INPUT=y, CONFIG_INPUT_KEYBOARD=y   # obvio
+  CONFIG_HW_RANDOM=y             # entropía para dropbear
+  CONFIG_HW_RANDOM_VIRTIO=y
+
+CONFIG QUE DEJAMOS DESACTIVADO (para no engordar):
+  CONFIG_MODULES=n               # todo built-in
+  CONFIG_SMP=n                   # single-CPU
+  CONFIG_HIGHMEM=n               # con 128 MB RAM no hace falta
+  CONFIG_SOUND=n
+  CONFIG_USB_STORAGE=? (opcional, si querés leer pendrives)
+  CONFIG_DRM, FB=? (si querés framebuffer bonito, sumalo)
+
+TAMAÑO: bzImage ~1.2-1.5 MB.
+
+INSTALACIÓN: copiás arch/x86/boot/bzImage al isolinux/ del ISO.
+
+
+3.2 musl libc
+-------------
+QUÉ HACE: la libc contra la que linkean TODOS los binarios de userland.
+
+ORIGEN: ya viene embebida en i486-linux-musl-cross/. No lo compilamos aparte.
+
+ROL EN EL TARGET: como linkeamos TODO estático, no hay archivos de musl
+  que instalar en el rootfs en runtime. Las libs .a viajan DENTRO de cada
+  binario.
+
+PERO SÍ copiamos a /usr/include los headers de musl para que TCC pueda
+  compilar cosas DENTRO del MiniLinux. Esos headers viven en el sysroot
+  del cross: i486-linux-musl-cross/i486-linux-musl/include/.
+
+
+3.3 busybox 1.36
+----------------
+QUÉ HACE: ES el 80% del userland. Un único binario que, según con qué nombre
+  lo invoques (vía symlinks), hace de sh, ls, cat, mount, init, mdev, httpd,
+  telnetd, nc, wget, udhcpc, vi, tar, gzip, sed, awk, etc.
+
+ORIGEN: https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+  Ya tenés 1.36.1 compilado. Vamos a REHACER la config para habilitar lo
+  que falta.
+
+DEPS DE HOST: build-essential.
+DEPS DE TARGET: ninguna si static.
+
+CONFIG DIFF vs tu build actual:
+  CONFIG_STATIC=y                        # ya está
+  CONFIG_FEATURE_INSTALLER=y             # para busybox --install
+  # Nuevos applets a habilitar:
+  CONFIG_HTTPD=y
+  CONFIG_FEATURE_HTTPD_RANGES=y
+  CONFIG_FEATURE_HTTPD_SETUID=y
+  CONFIG_TELNETD=y
+  CONFIG_TELNET=y                        # cliente
+  CONFIG_UDHCPC=y
+  CONFIG_IFCONFIG=y
+  CONFIG_ROUTE=y
+  CONFIG_PING=y
+  CONFIG_NC=y
+  CONFIG_WGET=y
+  CONFIG_TFTP=y
+  CONFIG_INIT=y
+  CONFIG_FEATURE_USE_INITTAB=y
+  CONFIG_GETTY=y
+  CONFIG_LOGIN=y                         # si querés pedir password
+  CONFIG_SU=y
+  CONFIG_TAR=y, GZIP=y, XZ=y             # para scripts y backups
+  CONFIG_VI=y (lo dejamos, es útil tener algo vi-like de respaldo)
+
+TAMAÑO: ~450 KB con esta config (vs 290 KB actual).
+
+INSTALACIÓN: make install CONFIG_PREFIX=/ruta/al/rootfs crea los symlinks.
+
+
+3.4 ncurses 6.4
+---------------
+QUÉ HACE: librería para hacer TUI (interfaces en terminal). Maneja cursor,
+  colores, teclas especiales, redraw, usando terminfo. La usan nano, joe y
+  casi todo editor TUI serio.
+
+ORIGEN: https://invisible-mirror.net/archives/ncurses/ncurses-6.4.tar.gz
+
+DEPS DE HOST: build-essential.
+DEPS DE TARGET: necesitamos la libncurses.a para linkar nano/joe, y un
+  mini-terminfo compilado en disco para que FUNCIONEN en runtime.
+
+FLAGS DE CONFIGURE (resumen, el config completo va en la guía):
+  --host=i486-linux-musl
+  --prefix=/usr
+  --with-sysroot=<sysroot del cross>
+  --without-ada --without-tests --without-cxx --without-cxx-binding
+  --without-manpages --without-progs --without-pkg-config
+  --without-shared --enable-static
+  --with-termlib
+  --disable-db-install            # no instala el terminfo gigante
+  --enable-widec=no               # ASCII-only, mucho más chico
+
+Después, generamos SOLO las entries que queremos con tic:
+  tic -x -o rootfs/usr/share/terminfo linux
+  tic -x -o rootfs/usr/share/terminfo xterm
+  tic -x -o rootfs/usr/share/terminfo xterm-256color
+  tic -x -o rootfs/usr/share/terminfo vt100
+  tic -x -o rootfs/usr/share/terminfo screen
+  tic -x -o rootfs/usr/share/terminfo linux-256color
+
+TAMAÑO EN ROOTFS: libs NO van (son solo para build). Terminfo ~30 KB.
+
+NOTA IMPORTANTE: ncurses es solo DEP DE BUILD para nano y joe. En el rootfs
+  final no instalamos libncurses.so ni .a; están embebidos en los binarios.
+
+
+3.5 bash 5.2
+------------
+QUÉ HACE: el shell de scripting serio. Arrays, funciones, globbing extendido,
+  [[ ]], aritmética, process substitution, sintaxis que ash no soporta.
+
+ORIGEN: https://ftp.gnu.org/gnu/bash/bash-5.2.tar.gz
+
+DEPS DE HOST: build-essential.
+DEPS DE TARGET: ninguna, estático.
+
+FLAGS:
+  CC=i486-linux-musl-gcc
+  CFLAGS="-Os -static"
+  LDFLAGS="-static"
+  ./configure --host=i486-linux-musl --prefix=/usr --without-bash-malloc \
+              --enable-static-link --disable-nls --disable-rpath \
+              --disable-readline-shared
+
+  --without-bash-malloc evita incompatibilidad con musl.
+  --enable-static-link produce binario estático.
+  --disable-nls quita soporte de traducciones (ahorro).
+
+TAMAÑO: ~1 MB.
+
+INSTALACIÓN: copiamos bash a rootfs/usr/bin/bash. Mantenemos /bin/sh ->
+  busybox (ash) porque ash es más predecible para scripts del sistema;
+  bash lo invocás explícitamente.
+
+
+3.6 nano 7.x
+------------
+QUÉ HACE: editor TUI amigable, estilo pico. Teclas visibles al pie.
+
+ORIGEN: https://www.nano-editor.org/dist/v7/nano-7.2.tar.xz
+
+DEPS DE HOST: build-essential, ncurses cross ya compilado.
+DEPS DE TARGET: terminfo (ya lo pusimos). Opcionalmente ~/.nanorc.
+
+FLAGS:
+  ./configure --host=i486-linux-musl --prefix=/usr \
+              --enable-tiny --disable-nls --disable-utf8 \
+              --without-slang \
+              LDFLAGS="-static" \
+              CFLAGS="-Os -static" \
+              NCURSES_CFLAGS="-I<ncurses_prefix>/include" \
+              NCURSES_LIBS="<ncurses_prefix>/lib/libncurses.a"
+
+  --enable-tiny saca features poco usadas; podés quitarlo si querés el full.
+
+TAMAÑO: ~250 KB (tiny).
+
+CONFIG RUNTIME: /etc/nanorc global y ~/.nanorc por usuario. Podés editar
+  colores y syntax highlighting SIN recompilar.
+
+
+3.7 joe 4.x
+-----------
+QUÉ HACE: editor TUI con tres personalidades según cómo lo invocás:
+  joe   -> wordstar
+  jmacs -> emacs-like
+  jpico -> pico/nano-like
+  jstar -> wordstar
+  rjoe  -> restricted
+Macros, undo, syntax highlighting, split windows, hooks.
+
+ORIGEN: https://sourceforge.net/projects/joe-editor/files/
+
+DEPS DE HOST: build-essential, ncurses cross.
+DEPS DE TARGET: /etc/joe/joerc (config) y /etc/joe/*.jsf (syntax files).
+
+FLAGS:
+  ./configure --host=i486-linux-musl --prefix=/usr --sysconfdir=/etc \
+              LDFLAGS="-static" CFLAGS="-Os -static" \
+              --with-curses=<ncurses_prefix>
+
+TAMAÑO: ~400 KB + ~100 KB de syntax files.
+
+CONFIG RUNTIME: /etc/joe/joerc es tu amigo. 100% editable sin recompilar.
+
+
+3.8 tcc 0.9.27
+--------------
+QUÉ HACE: compilador de C ligero y rápido. Trae su propio ensamblador y
+  linker. Un binario con todo. Puede además EJECUTAR programas C como
+  scripts: #!/usr/bin/tcc -run.
+
+ORIGEN: https://download.savannah.gnu.org/releases/tinycc/tcc-0.9.27.tar.bz2
+  O mirror actualizado del git.
+
+DEPS DE HOST: build-essential.
+DEPS DE TARGET: para compilar HELLO WORLD realista necesita:
+  - headers del kernel en /usr/include/{linux,asm,asm-generic}
+  - headers de musl en /usr/include/{stdio.h, string.h, etc.}
+  - libs estáticas de musl (libc.a, crt1.o, crti.o, crtn.o) en /usr/lib
+    para hacer -static.
+
+FLAGS DE BUILD (cross es más delicado con tcc; conviene build "nativo
+  simulado"):
+  ./configure --cpu=i386 --cross-prefix=i486-linux-musl- \
+              --prefix=/usr --sysincludedir=/usr/include \
+              --libdir=/usr/lib \
+              --extra-cflags="-static" --extra-ldflags="-static"
+
+  Después  make cross-i386  y  make install DESTDIR=rootfs
+
+TAMAÑO: ~250 KB binario + ~100 KB libtcc1.a.
+
+NOTA: tcc tiene su propio libtcc1 (runtime stub para cosas como
+  __udivdi3). Va en /usr/lib/tcc/.
+
+
+3.9 Headers de desarrollo
+-------------------------
+Para que tcc compile algo útil en runtime, el rootfs necesita headers.
+
+(a) KERNEL HEADERS:
+    En el source del kernel:
+      make headers_install INSTALL_HDR_PATH=rootfs/usr ARCH=x86
+    Instala /usr/include/{linux, asm, asm-generic, mtd, ...}
+    Tamaño: ~2 MB (podemos borrar subdirs que nunca vamos a usar).
+
+(b) MUSL HEADERS + STATIC LIBS:
+    Del sysroot del cross:
+      cp -r i486-linux-musl-cross/i486-linux-musl/include/* rootfs/usr/include/
+      cp i486-linux-musl-cross/i486-linux-musl/lib/libc.a rootfs/usr/lib/
+      cp i486-linux-musl-cross/i486-linux-musl/lib/crt1.o rootfs/usr/lib/
+      cp i486-linux-musl-cross/i486-linux-musl/lib/crti.o rootfs/usr/lib/
+      cp i486-linux-musl-cross/i486-linux-musl/lib/crtn.o rootfs/usr/lib/
+      cp i486-linux-musl-cross/i486-linux-musl/lib/libm.a rootfs/usr/lib/
+      cp i486-linux-musl-cross/i486-linux-musl/lib/libpthread.a rootfs/usr/lib/
+
+Con esto, DENTRO de minilinux:
+  tcc hello.c -o hello -static
+  ./hello
+funciona.
+
+
+3.10 lua 5.4
+------------
+QUÉ HACE: lenguaje de scripting ligero, embebible, limpio. Un intérprete
+  (lua) + un bytecode compiler (luac).
+
+ORIGEN: https://www.lua.org/ftp/lua-5.4.6.tar.gz
+
+DEPS DE HOST: build-essential.
+DEPS DE TARGET: ninguna si static. readline opcional (nosotros NO).
+
+BUILD:
+  make linux CC=i486-linux-musl-gcc MYCFLAGS="-Os -static" \
+             MYLDFLAGS="-static" MYLIBS=
+  (el MYLIBS vacío quita readline)
+
+  make install INSTALL_TOP=rootfs/usr
+
+TAMAÑO: lua + luac ~300 KB. Librería estándar embebida.
+
+
+3.11 micropython
+----------------
+QUÉ HACE: subset de Python 3, pensado para embebidos. Sintaxis Python,
+  stdlib reducida (no tiene ssl, requests, asyncio completo, etc.).
+
+ORIGEN: https://github.com/micropython/micropython
+
+Para Linux, se builda el puerto "unix":
+  cd ports/unix
+  make CC=i486-linux-musl-gcc CFLAGS_EXTRA="-Os -static" \
+       LDFLAGS_EXTRA="-static" V=1
+
+DEPS DE HOST: build-essential.
+DEPS DE TARGET: ninguna.
+
+TAMAÑO: ~400 KB.
+
+INSTALACIÓN: copiás build/micropython a rootfs/usr/bin/micropython.
+  Si querés paquetes extra (Python pure modules), van en
+  /usr/lib/micropython/.
+
+
+3.12 dropbear 2024.x
+--------------------
+QUÉ HACE: SSH server y client. Incluye: dropbear (sshd), dbclient (ssh),
+  dropbearkey (gen keys), dropbearconvert, scp.
+
+ORIGEN: https://matt.ucc.asn.au/dropbear/dropbear.html
+
+DEPS DE HOST: build-essential.
+DEPS DE TARGET: /dev/urandom funcionando (ya está), passwd/shadow.
+
+BUILD:
+  ./configure --host=i486-linux-musl --prefix=/usr \
+              --disable-zlib --disable-pam --disable-lastlog \
+              --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx
+  make PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp" \
+       STATIC=1 CC=i486-linux-musl-gcc
+
+TAMAÑO: ~400-500 KB (combined binary posible, un solo blob con todo).
+
+CONFIG RUNTIME: /etc/dropbear/ con host keys. Las generamos en primer
+  boot con dropbearkey si no existen.
+
+
+3.13 rsync 3.2.x
+----------------
+QUÉ HACE: sincronización incremental de archivos y directorios.
+
+ORIGEN: https://download.samba.org/pub/rsync/rsync-3.2.7.tar.gz
+
+DEPS DE HOST: build-essential.
+DEPS DE TARGET: ninguna (deshabilitamos zlib, xattr, acl).
+
+BUILD:
+  ./configure --host=i486-linux-musl --prefix=/usr \
+              --disable-xxhash --disable-zstd --disable-lz4 \
+              --disable-openssl --disable-xattr --disable-acl \
+              --disable-md2man \
+              CFLAGS="-Os -static" LDFLAGS="-static"
+
+TAMAÑO: ~800 KB.
+
+
+3.14 syslinux / isolinux
+------------------------
+QUÉ HACE: bootloader. isolinux.bin es el blob que va en el ISO.
+
+ORIGEN: paquete syslinux-utils de Ubuntu te da todo.
+  O https://www.kernel.org/pub/linux/utils/boot/syslinux/syslinux-6.04-pre1.tar.gz
+
+ARCHIVOS QUE COPIAMOS AL ISO:
+  isolinux.bin             (de /usr/lib/ISOLINUX/)
+  ldlinux.c32              (de /usr/lib/syslinux/modules/bios/)
+  libutil.c32              (idem)
+  libcom32.c32             (idem, si usamos menú)
+  menu.c32 o vesamenu.c32  (menú)
+
+NOTA: en Ubuntu, instalar syslinux, syslinux-utils, isolinux. Los
+archivos .c32 están en /usr/lib/syslinux/modules/bios/.
+
+
+================================================================================
+  4. JERARQUÍA DEL ROOTFS FINAL
+================================================================================
+
+Después del make install de cada paquete, el rootfs queda así (resumen,
+no listo todos los symlinks de busybox):
+
+  rootfs/
+    bin -> usr/bin
+    sbin -> usr/sbin
+    lib -> usr/lib
+    dev/
+    etc/
+      inittab
+      fstab
+      profile
+      hostname
+      hosts
+      resolv.conf
+      motd
+      passwd, group, shadow, shells
+      init.d/
+        rcS         (sysinit)
+        rcK         (shutdown)
+        network     (helper)
+        dropbear    (helper)
+      dropbear/     (vacío; se llena en runtime)
+      joe/
+        joerc
+        *.jsf
+      nanorc
+    home/
+      user/         (opcional; crear user no-root)
+    mnt/
+    opt/
+    proc/           (vacío; se monta en rcS)
+    root/
+      .profile
+      .bashrc
+      .nanorc
+      .joerc
+    run/
+    sys/            (vacío; se monta en rcS)
+    tmp/
+    usr/
+      bin/
+        busybox
+        [symlinks de busybox: sh, ash, ls, cat, mount, ...]
+        bash
+        nano
+        joe, jmacs, jpico, jstar (symlinks a joe)
+        tcc
+        lua, luac
+        micropython
+        dbclient, dropbearkey, dropbearconvert, scp
+        rsync
+      sbin/
+        init -> ../bin/busybox
+        [symlinks de busybox: ifconfig, route, udhcpc, mdev, getty, ...]
+        dropbear
+      lib/
+        libc.a           (musl, para tcc -static)
+        libm.a
+        libpthread.a
+        crt1.o, crti.o, crtn.o
+        tcc/
+          libtcc1.a
+      include/
+        linux/     (kernel headers)
+        asm/
+        asm-generic/
+        [musl headers: stdio.h, stdlib.h, ...]
+      share/
+        terminfo/
+          l/linux, l/linux-256color
+          x/xterm, x/xterm-256color
+          v/vt100
+          s/screen
+        lua/
+    var/
+      log/
+      www/
+        index.html
+      run/
+
+
+================================================================================
+  5. SCRIPTS Y CONFIGURACIONES (línea por línea)
+================================================================================
+
+5.1 /etc/inittab
+----------------
+Lo lee busybox init (PID 1). Formato: id:runlevels:action:process.
+En busybox los runlevels se ignoran; lo que importa es action.
+
+  ::sysinit:/etc/init.d/rcS
+      #  sysinit = ejecutar al arrancar, ANTES de todo lo demás.
+      #  init espera a que termine para continuar.
+      #  En rcS montamos /proc /sys /dev/pts /tmp y levantamos red.
+
+  ::respawn:/sbin/getty -L tty1 38400 linux
+      #  respawn = si el proceso termina, init lo vuelve a lanzar.
+      #  getty abre una terminal en tty1. -L dice "sin detección de módem".
+      #  38400 es el baud (irrelevante para tty virtuales).
+      #  linux = tipo de terminal que exporta a TERM.
+
+  ::respawn:/sbin/getty -L ttyS0 115200 vt100
+      #  Consola por puerto serie. Útil para QEMU con -serial y PCs reales.
+
+  ::ctrlaltdel:/sbin/reboot
+      #  Ctrl+Alt+Del en consola -> reboot limpio.
+
+  ::shutdown:/etc/init.d/rcK
+      #  Al apagar (poweroff), ejecuta rcK antes de cortar.
+      #  rcK sincroniza, apaga dropbear, desmonta.
+
+
+5.2 /etc/init.d/rcS
+-------------------
+  #!/bin/sh
+  # Monta /proc: el kernel expone info de procesos y runtime aquí.
+  mount -t proc    proc    /proc
+  # Monta /sys: filesystem de dispositivos y buses (sysfs).
+  mount -t sysfs   sysfs   /sys
+  # devtmpfs ya lo monta el kernel si DEVTMPFS_MOUNT=y; si no:
+  mount -t devtmpfs devtmpfs /dev 2>/dev/null
+  # /dev/pts para pseudoterminales (ssh, screen, etc.)
+  mkdir -p /dev/pts
+  mount -t devpts  devpts  /dev/pts
+  # /tmp en tmpfs
+  mount -t tmpfs   tmpfs   /tmp
+  mount -t tmpfs   tmpfs   /run
+
+  # mdev: lee /sys y crea los nodos restantes en /dev según reglas.
+  echo /sbin/mdev > /proc/sys/kernel/hotplug
+  mdev -s
+
+  # Hostname
+  hostname -F /etc/hostname
+
+  # Levantar loopback (muchas cosas asumen 127.0.0.1)
+  ifconfig lo 127.0.0.1 up
+
+  # Red externa
+  /etc/init.d/network start &
+
+  # SSH
+  /etc/init.d/dropbear start &
+
+  # MOTD
+  cat /etc/motd
+
+
+5.3 /etc/init.d/network
+-----------------------
+  #!/bin/sh
+  case "$1" in
+    start)
+      # Trae eth0 up y pide DHCP.
+      ifconfig eth0 up
+      # -b = daemonize después de obtener lease.
+      # -S = loguea por syslog.
+      udhcpc -i eth0 -b -S -q >/dev/null 2>&1
+      ;;
+    stop)
+      killall udhcpc 2>/dev/null
+      ifconfig eth0 down
+      ;;
+  esac
+
+
+5.4 /etc/init.d/dropbear
+------------------------
+  #!/bin/sh
+  DBDIR=/etc/dropbear
+  mkdir -p "$DBDIR"
+  # Generar host keys si no existen (primer boot).
+  [ -f "$DBDIR/dropbear_rsa_host_key" ]      || dropbearkey -t rsa    -f "$DBDIR/dropbear_rsa_host_key"      >/dev/null
+  [ -f "$DBDIR/dropbear_ed25519_host_key" ]  || dropbearkey -t ed25519 -f "$DBDIR/dropbear_ed25519_host_key" >/dev/null
+  case "$1" in
+    start) dropbear -r "$DBDIR/dropbear_rsa_host_key" -r "$DBDIR/dropbear_ed25519_host_key" ;;
+    stop)  killall dropbear 2>/dev/null ;;
+  esac
+
+
+5.5 /etc/fstab
+--------------
+Normalmente init usa inittab, pero fstab sirve para mount -a y como
+documentación de qué se espera dónde.
+
+  # <fs>        <mount>   <type>     <opts>              <dump> <pass>
+  proc          /proc     proc       defaults            0      0
+  sysfs         /sys      sysfs      defaults            0      0
+  devtmpfs      /dev      devtmpfs   defaults            0      0
+  devpts        /dev/pts  devpts     defaults            0      0
+  tmpfs         /tmp      tmpfs      defaults            0      0
+  tmpfs         /run      tmpfs      defaults            0      0
+
+
+5.6 /etc/profile
+----------------
+Lo lee el shell en login mode. Define entorno global.
+
+  export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  export HOME=${HOME:-/root}
+  export TERM=${TERM:-linux}
+  export PS1='\u@\h:\w\$ '
+  export EDITOR=nano
+  # Colores en ls/grep
+  alias ls='ls --color=auto'
+  alias grep='grep --color=auto'
+  alias ll='ls -lah'
+  # Historia persistente del bash (si se usa bash)
+  export HISTFILE=/root/.bash_history
+  export HISTSIZE=1000
+  # Terminfo por si acaso
+  export TERMINFO=/usr/share/terminfo
+
+
+5.7 /etc/passwd, /etc/group, /etc/shadow
+----------------------------------------
+/etc/passwd:
+  root:x:0:0:root:/root:/bin/sh
+
+/etc/group:
+  root:x:0:
+
+/etc/shadow:
+  root::19700::::::
+  # El doble : vacío = sin contraseña. Para dropbear con login sin pass
+  # hay que setear PermitEmptyPasswords y config propia. Más seguro:
+  # dar a root una pass real con mkpasswd.
+
+Si querés un usuario no-root:
+  user:x:1000:1000:user:/home/user:/bin/sh
+
+5.8 /etc/hosts, /etc/hostname, /etc/resolv.conf
+-----------------------------------------------
+hostname:
+  minilinux
+
+hosts:
+  127.0.0.1   localhost minilinux
+  ::1         localhost
+
+resolv.conf:
+  # udhcpc puede sobreescribirlo si el DHCP da DNS.
+  nameserver 1.1.1.1
+  nameserver 8.8.8.8
+
+
+================================================================================
+  6. FLUJO DE BUILD DE ALTO NIVEL
+================================================================================
+
+Orden sugerido (fases):
+
+  FASE A - preparar workspace
+    build/
+      sources/        (tarballs descargados)
+      staging/        (dirs de build)
+      cross-tools/    (symlink o copia a i486-linux-musl-cross/)
+      rootfs/         (acá se arma el filesystem del target)
+      iso/            (acá se arma el árbol del ISO)
+
+  FASE B - herramientas de build auxiliares
+    ncurses cross-static -> instalar en staging/ncurses-prefix/
+
+  FASE C - kernel
+    1. make ARCH=x86 defconfig (o copiar tu .config)
+    2. menuconfig para activar lo listado en 3.1
+    3. make -j$(nproc) bzImage
+    4. make -j$(nproc) headers_install INSTALL_HDR_PATH=rootfs/usr
+    5. cp arch/x86/boot/bzImage iso/isolinux/
+
+  FASE D - busybox
+    1. make defconfig
+    2. menuconfig para habilitar lo del 3.3
+    3. make -j$(nproc) CROSS_COMPILE=i486-linux-musl-
+    4. make install CONFIG_PREFIX=rootfs
+
+  FASE E - userland extra (orden libre, pero joe/nano después de ncurses)
+    bash, tcc, lua, micropython, dropbear, rsync -> todos a rootfs
+    nano, joe -> después de ncurses
+
+  FASE F - headers y libs para tcc dentro del target
+    Copiar musl headers + libc.a + crt*.o al rootfs
+    (ya vimos los paths en 3.9)
+
+  FASE G - configuración del rootfs
+    Crear etc/* con los contenidos de la sección 5.
+    chmod +x en init scripts.
+    mkdir vacíos (proc, sys, tmp, run, dev, mnt, home, var/log, var/www).
+
+  FASE H - empaquetar initramfs
+    cd rootfs
+    find . | cpio -H newc -o | xz --check=crc32 -9e > ../iso/isolinux/rootfs.cpio.xz
+
+  FASE I - armar ISO
+    cp /usr/lib/ISOLINUX/isolinux.bin iso/isolinux/
+    cp /usr/lib/syslinux/modules/bios/{ldlinux.c32,libutil.c32,libcom32.c32,menu.c32} iso/isolinux/
+    escribir iso/isolinux/isolinux.cfg
+    xorriso -as mkisofs -o minilinux.iso \
+            -c isolinux/boot.cat -b isolinux/isolinux.bin \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -R -J \
+            iso/
+    isohybrid minilinux.iso
+
+  FASE J - probar
+    qemu-system-i386 -cdrom minilinux.iso -m 128 -enable-kvm \
+      -netdev user,id=n0,hostfwd=tcp::2222-:22 \
+      -device e1000,netdev=n0
+
+
+================================================================================
+  7. HERRAMIENTAS DE HOST NECESARIAS (Ubuntu)
+================================================================================
+
+  sudo apt install \
+    build-essential bc bison flex libelf-dev libssl-dev libncurses-dev \
+    xz-utils cpio xorriso syslinux syslinux-utils isolinux \
+    git wget curl \
+    qemu-system-x86
+
+El cross-toolchain i486-linux-musl-cross ya está descargado en
+/home/dante/mini_linux/i486-linux-musl-cross. Hay que agregar su bin/
+al PATH en cada sesión de build:
+
+  export PATH=/home/dante/mini_linux/i486-linux-musl-cross/bin:$PATH
+
+
+================================================================================
+  8. PREGUNTAS ABIERTAS ANTES DE ARRANCAR
+================================================================================
+
+Q1. Usuario no-root por default: ¿lo creamos (user:user) o seguís como root?
+Q2. Password para root en SSH: ¿ninguna (abierto), pass fija "minilinux" al
+    boot, o preferís poner authorized_keys y solo key-based?
+Q3. /var/www: ¿incluimos un index.html de ejemplo con algo útil (listado
+    de /home) o solo "it works"?
+Q4. Framebuffer para consola bonita (tipografía mejor, resoluciones): ¿lo
+    sumamos (CONFIG_FB_VESA + CONFIG_FRAMEBUFFER_CONSOLE) o dejamos texto
+    80x25 clásico?
+Q5. Soporte USB storage y USB keyboard en kernel: ¿lo incluimos para boot
+    real desde USB o solo apuntamos a QEMU por ahora?
+Q6. Persistencia: ¿agregamos un script "save a /dev/sdX" para volcar el
+    rootfs modificado a un ext4 y poder bootear desde ahí, o es más puro
+    live-only?
+Q7. ¿Incluimos nanorc syntax files para C/sh/python? Vienen con nano en
+    docs/syntax/ y son ~50 KB.
+Q8. ¿Compilás con -Os (size) o -O2 (speed)? -Os ahorra ~10-20% en binarios
+    sin diferencia perceptible en un sistema que casi no hace cómputo pesado.
+
+
+================================================================================
+  FIN DEL DOCUMENTO DE ARQUITECTURA
+================================================================================

@@ -1,0 +1,18 @@
+██╗     ██╗██╗         ██╗██╗      ██╗                           
+████╗ ████║╚═╝██████╗  ╚═╝██║      ╚═╝██████╗  ██╗   ██╗██╗   ██╗
+██╔═██╔═██║██╗██╔═══██╗██╗██║      ██╗██╔═══██╗██║   ██║╚═████╔═╝
+██║ ╚═╝ ██║██║██║   ██║██║██║      ██║██║   ██║██║   ██║  ████║  
+██║     ██║██║██║   ██║██║████████╗██║██║   ██║╚═██████║██╔═══██╗
+╚═╝     ╚═╝╚═╝╚═╝   ╚═╝╚═╝╚═══════╝╚═╝╚═╝   ╚═╝  ╚═════╝╚═╝   ╚═╝
+                                                                 
+ MiniLinux 2.0  -  built on 26/11/26
+ kernel 6.14  /  busybox 1.36  /  musl static
+
+ Quick start:
+   ip               ->  ifconfig eth0
+   ssh in           ->  from host:  ssh -p 2222 mux@localhost
+   http files       ->  http://<ip>/  (serves /var/www)
+   edit code        ->  nano foo.c   or   joe foo.c
+   compile C        ->  tcc hello.c -o hello
+   scripting        ->  lua  |  micropython
+

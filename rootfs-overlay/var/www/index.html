@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MiniLinux 2.0</title>
+<style>
+  :root {
+    --bg:         #0d0f13;
+    --bg-panel:   #161922;
+    --fg:         #cfd4de;
+    --fg-dim:     #7a8290;
+    --accent:     #7fd4ff;
+    --accent-2:   #a0e6a0;
+    --accent-3:   #f0a0a0;
+    --border:     #2a2f3b;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:        #f6f6f3;
+      --bg-panel:  #ffffff;
+      --fg:        #1a1d24;
+      --fg-dim:    #5a6170;
+      --accent:    #0b6ea0;
+      --accent-2:  #2e7a2e;
+      --accent-3:  #a03535;
+      --border:    #d8dae0;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0;
+    background: var(--bg); color: var(--fg);
+    font-family: ui-monospace, Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    font-size: 15px; line-height: 1.5;
+  }
+  .wrap {
+    max-width: 820px;
+    margin: 0 auto;
+    padding: 32px 16px 80px;
+  }
+  .banner {
+    color: var(--accent);
+    font-size: 11px;
+    line-height: 1.1;
+    white-space: pre;
+    overflow-x: auto;
+    margin: 0 0 8px;
+  }
+  .tagline {
+    color: var(--fg-dim);
+    margin: 0 0 32px;
+    font-size: 13px;
+  }
+  .tagline strong { color: var(--fg); }
+
+  section {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 20px 22px;
+    margin: 18px 0;
+  }
+  h2 {
+    margin: 0 0 14px;
+    font-size: 15px;
+    color: var(--accent);
+    font-weight: 600;
+    letter-spacing: 0.3px;
+  }
+  h2::before {
+    content: "> ";
+    color: var(--fg-dim);
+  }
+  p { margin: 8px 0; }
+
+  .cta {
+    display: inline-block;
+    padding: 14px 24px;
+    background: transparent;
+    color: var(--accent);
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    text-decoration: none;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    transition: background 0.15s, color 0.15s;
+  }
+  .cta:hover {
+    background: var(--accent);
+    color: var(--bg);
+  }
+
+  pre.cmd {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent-2);
+    border-radius: 3px;
+    padding: 10px 14px;
+    margin: 10px 0;
+    overflow-x: auto;
+    font-size: 13.5px;
+    color: var(--fg);
+  }
+  .cmt { color: var(--fg-dim); }
+  .ok  { color: var(--accent-2); }
+  .no  { color: var(--accent-3); }
+
+  footer {
+    margin-top: 40px;
+    text-align: center;
+    color: var(--fg-dim);
+    font-size: 12px;
+  }
+  footer a { color: var(--fg-dim); }
+
+  @media (max-width: 480px) {
+    .banner { font-size: 8px; }
+    .wrap { padding: 20px 12px 60px; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<pre class="banner">
+██╗     ██╗██╗         ██╗██╗      ██╗
+████╗ ████║╚═╝██████╗  ╚═╝██║      ╚═╝██████╗  ██╗   ██╗██╗   ██╗
+██╔═██╔═██║██╗██╔═══██╗██╗██║      ██╗██╔═══██╗██║   ██║╚═████╔═╝
+██║ ╚═╝ ██║██║██║   ██║██║██║      ██║██║   ██║██║   ██║  ████║
+██║     ██║██║██║   ██║██║████████╗██║██║   ██║╚═██████║██╔═══██╗
+╚═╝     ╚═╝╚═╝╚═╝   ╚═╝╚═╝╚═══════╝╚═╝╚═╝   ╚═╝  ╚═════╝╚═╝   ╚═╝
+</pre>
+
+<p class="tagline">
+  <strong>MiniLinux 2.0</strong> &middot;
+  kernel 6.14 &middot;
+  busybox 1.36 &middot;
+  musl static
+</p>
+
+<section>
+  <h2>Browse / Download files</h2>
+  <p>Shared files are under <code>/home/mux</code>, exposed via HTTP.</p>
+  <p style="margin-top:18px;">
+    <a class="cta" href="/files/">Open file browser &rarr;</a>
+  </p>
+</section>
+
+<section>
+  <h2>Upload a file (via scp)</h2>
+  <p>
+    Web upload is intentionally not supported to keep this system minimal.
+    Transfer files using <strong>scp</strong> over SSH (port 22):
+  </p>
+<pre class="cmd"><span class="cmt"># push a file from your machine into /home/mux:</span>
+scp ./localfile.txt mux@<span class="ok">&lt;minilinux-ip&gt;</span>:/home/mux/
+
+<span class="cmt"># push a whole directory recursively:</span>
+scp -r ./myproject mux@<span class="ok">&lt;minilinux-ip&gt;</span>:/home/mux/
+
+<span class="cmt"># pull from MiniLinux to your machine:</span>
+scp mux@<span class="ok">&lt;minilinux-ip&gt;</span>:/home/mux/notes.txt ./</pre>
+  <p class="cmt">
+    GUI alternatives: Nautilus, Dolphin and Finder connect with
+    <code>sftp://mux@&lt;ip&gt;/home/mux</code>.
+    On Windows use WinSCP or FileZilla.
+  </p>
+</section>
+
+<section>
+  <h2>Quick commands (from inside MiniLinux)</h2>
+<pre class="cmd"><span class="cmt"># network info</span>
+ifconfig eth0
+
+<span class="cmt"># edit a file</span>
+nano foo.c      <span class="cmt">#  or:  joe foo.c</span>
+
+<span class="cmt"># compile and run C in one shot</span>
+tcc hello.c -o hello &amp;&amp; ./hello
+
+<span class="cmt"># script with lua or micropython</span>
+lua
+micropython</pre>
+</section>
+
+<footer>
+  served by <code>busybox httpd</code> &middot; no cookies, no tracking, no js
+</footer>
+
+</div>
+</body>
+</html>

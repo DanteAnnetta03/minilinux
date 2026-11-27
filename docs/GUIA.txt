@@ -1,0 +1,1539 @@
+================================================================================
+  MiniLinux 2.0 - Guía de construcción paso a paso
+================================================================================
+
+Esta guía te lleva de "Ubuntu 26.04 limpio" a "ISO booteable de ~16 MB con
+shell, editor, compilador, SSH y scripting". Está pensada para que APRENDAS
+construyendo: no es un script que copias y pegas. Los comandos de compilación
+los doy completos (equivocarse un flag arruina horas), pero los scripts de
+init y config los vas a escribir vos con los esqueletos y pistas que te doy.
+
+ANTES DE EMPEZAR, lee ARQUITECTURA.txt. La guía asume que ya sabés:
+  - Qué es un initramfs.
+  - Qué es un cross-compiler y por qué todo va static-musl.
+  - Qué hace cada paquete y por qué está en la lista.
+
+CONVENCIONES:
+  $    comando como usuario normal
+  #    comando como root
+  <tu># comando DENTRO del MiniLinux ya booteado
+  [[hint]]  pista para que escribas vos
+  [checkpoint]  verificación: si falla, parar y arreglar antes de seguir
+
+NOMBRE DEL SISTEMA: "minilinux". Esa va a ser la contraseña de root y user
+también (según tu decisión).
+
+
+================================================================================
+  PARTE 0 - PREPARATIVOS Y LIMPIEZA DEL WORKSPACE
+================================================================================
+
+0.1 Backup rápido de lo que hicimos
+-----------------------------------
+No tirar nada todavía. Guardamos lo útil:
+
+  $ cd /home/dante/mini_linux
+  $ mkdir -p archive/v1-floppinux
+  $ mv bzImage rootfs.cpio.xz syslinux.cfg minilinux.img hello.txt filesystem archive/v1-floppinux/
+
+Dejamos en la raíz:
+  - ARQUITECTURA.txt, NOTAS.txt, GUIA.txt (docs)
+  - i486-linux-musl-cross/ (toolchain, la vamos a reutilizar)
+  - linux/ y busybox-1_36_1/ (sources viejos; si querés, también a archive/)
+
+Si querés empezar TOTALMENTE desde cero, mové también linux/ y busybox-1_36_1/
+a archive/ y bajalos de nuevo en las partes correspondientes. La guía asume
+que los bajás frescos.
+
+  $ mv linux busybox-1_36_1 archive/v1-floppinux/ 2>/dev/null || true
+
+0.2 Estructura del workspace 2.0
+--------------------------------
+Vamos a trabajar en una carpeta "build" con subdirectorios claros:
+
+  $ mkdir -p build/{sources,staging,rootfs,iso/isolinux}
+
+  sources   -> tarballs descargados
+  staging   -> build dirs de cada paquete y prefijos "fake" (ej: ncurses-prefix)
+  rootfs    -> el filesystem final del target (lo que termina en el initramfs)
+  iso       -> el árbol del ISO (kernel + initramfs + isolinux)
+
+[concepto: por qué separamos]
+  En cross-building hay dos filesystems en juego: el HOST (tu Ubuntu) y el
+  TARGET (el MiniLinux). "staging" es donde cosas se instalan temporalmente
+  en el host para ser usadas por otros builds. "rootfs" es solamente lo que
+  va a correr en el target. Mezclarlos es el origen de la mayoría de los
+  "it builds on my laptop but the target panics".
+
+0.3 Paquetes del host
+---------------------
+  $ sudo apt update
+  $ sudo apt install -y \
+      build-essential bc bison flex libelf-dev libssl-dev libncurses-dev \
+      xz-utils cpio xorriso syslinux syslinux-utils isolinux \
+      git wget curl pkg-config \
+      bdf2psf otf2bdf fontforge-nox \
+      whois \
+      qemu-system-x86
+
+[nota] 'whois' se instala por el utilitario 'mkpasswd' que trae (lo vas a
+usar en la Parte 14.5 para generar el hash SHA-512 que va en /etc/shadow).
+El paquete se llama así por razones históricas; también instala el cliente
+whois pero eso no nos importa.
+
+[nota] en Ubuntu NO existe el paquete "psftools" (es de Debian antiguo).
+Los dos binarios que usa el pipeline de la fuente Monocraft están en
+paquetes separados: bdf2psf (universe) y otf2bdf (universe). Si universe
+no está habilitado:
+  $ sudo add-apt-repository universe
+  $ sudo apt update
+
+Verificamos:
+
+  $ xorriso --version | head -1
+  $ ls /usr/lib/ISOLINUX/isolinux.bin
+  $ ls /usr/lib/syslinux/modules/bios/ldlinux.c32
+  $ fontforge --version 2>&1 | head -1
+
+[checkpoint] los cuatro comandos deben responder sin error.
+
+0.4 Variables de entorno de build
+---------------------------------
+Vamos a usar las mismas variables en toda la guía. Creá un archivo que
+puedas "source" cuando abras una terminal nueva:
+
+  $ cat > build/env.sh <<'EOF'
+  export MLX_ROOT=/home/dante/mini_linux
+  export MLX_BUILD=$MLX_ROOT/build
+  export MLX_SRC=$MLX_BUILD/sources
+  export MLX_STAGE=$MLX_BUILD/staging
+  export MLX_ROOTFS=$MLX_BUILD/rootfs
+  export MLX_ISO=$MLX_BUILD/iso
+  export MLX_CROSS=$MLX_ROOT/i486-linux-musl-cross
+  export MLX_SYSROOT=$MLX_CROSS/i486-linux-musl
+  export NCPREFIX=$MLX_STAGE/ncurses-prefix     # usado por nano y joe
+  export PATH=$MLX_CROSS/bin:$PATH
+  export CROSS=i486-linux-musl-
+  export CC=${CROSS}gcc
+  export CXX=${CROSS}g++
+  export AR=${CROSS}ar
+  export LD=${CROSS}ld
+  export STRIP=${CROSS}strip
+  export RANLIB=${CROSS}ranlib
+  export HOST_TRIPLET=i486-linux-musl
+  # -Os porque priorizamos tamaño. -static para linkado estático.
+  export MLX_CFLAGS="-Os -pipe"
+  export MLX_LDFLAGS="-static"
+  export MAKEFLAGS="-j$(nproc)"
+  EOF
+
+Y cada vez que abras una terminal nueva para seguir trabajando:
+
+  $ source /home/dante/mini_linux/build/env.sh
+
+[aprender bash]
+  'source archivo' (o '. archivo') ejecuta el script en TU shell actual, con
+  lo cual las export quedan vivas. Si en vez de eso corrés 'bash env.sh',
+  las variables mueren con el subshell.
+
+[aprender bash]
+  Dentro de << 'EOF' con comillas simples, el shell NO expande variables
+  (los $MLX_ROOT quedan literales). Con << EOF sin comillas, sí las expande.
+  Elegí según necesites.
+
+[checkpoint]
+  $ source build/env.sh
+  $ which i486-linux-musl-gcc
+  Debe mostrar la ruta dentro de i486-linux-musl-cross/bin/.
+
+
+================================================================================
+  PARTE 1 - EL KERNEL
+================================================================================
+
+1.1 Bajar el source
+-------------------
+  $ cd $MLX_SRC
+  $ wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.14.tar.xz
+  $ tar -xf linux-6.14.tar.xz -C $MLX_STAGE
+  $ cd $MLX_STAGE/linux-6.14
+
+1.2 Configuración base
+----------------------
+El kernel trae "defconfigs" para cada arquitectura. Partimos de uno pequeño:
+
+  $ make ARCH=x86 i386_defconfig
+
+Eso llena .config con un default razonable para i386. Ahora lo abrimos y
+ajustamos LO QUE YA DECIDIMOS en ARQUITECTURA.txt (sección 3.1):
+
+  $ make ARCH=x86 menuconfig
+
+[concepto: menuconfig]
+  menuconfig es una TUI (ncurses) que edita .config con un menú. Cada opción
+  tiene help con '?' (lee el help, muchos CONFIG_ son self-explanatory).
+  Buscar una opción por nombre: '/', escribir CONFIG_... Enter.
+
+Opciones a activar (lista corta, ver ARQUITECTURA.txt para el porqué):
+
+  Device Drivers -> Generic Driver Options:
+    [*] Maintain a devtmpfs filesystem to mount at /dev
+    [*]   Automount devtmpfs at /dev, after the kernel mounted the rootfs
+
+  Device Drivers -> Network device support:
+    [*] Ethernet driver support
+      [*] Intel(R) PRO/1000 Gigabit Ethernet support      (E1000)
+    [*] Virtio drivers
+      [*] Virtio network driver
+
+  Device Drivers -> Character devices -> Serial drivers:
+    [*] 8250/16550 and compatible serial support
+    [*]   Console on 8250/16550 and compatible serial port
+
+  Device Drivers -> HID support -> USB HID:
+    [*] USB HID transport layer
+
+  Device Drivers -> USB support:
+    [*] Support for Host-side USB
+    [*] EHCI HCD (USB 2.0) support
+    [*] XHCI HCD (USB 3)
+    [*] USB Mass Storage support
+
+  Device Drivers -> Graphics support:
+    [*] Framebuffer Devices
+      [*] VESA VGA graphics support                       (si queremos FB)
+    [*] Console display driver support
+      [*] Framebuffer Console support
+
+  File systems:
+    [*] The Extended 4 (ext4) Filesystem
+    [*] ISO 9660 CDROM file system support
+    [*]   Microsoft Joliet CDROM extensions
+    [*]   Transparent decompression extension             (ZISOFS)
+    [*] MSDOS fs support
+    [*] VFAT (Windows-95) fs support
+    [*]   Default codepage for FAT = 437
+    [*]   Default iocharset for FAT = iso8859-1
+    [*] Native language support
+      [*]   Codepage 437
+      [*]   NLS ISO 8859-1
+      [*]   NLS UTF-8
+    [*] Pseudo filesystems:
+      [*] Tmpfs virtual memory file system support
+      [*]   Tmpfs POSIX Access Control Lists (opcional, no esencial)
+
+  General setup:
+    [*] Initial RAM filesystem and RAM disk (initramfs/initrd) support
+    [*]   Support initial ramdisk/ramfs compressed using XZ
+    [*] Configure standard kernel features (expert users) -> epoll support
+
+  Networking support:
+    [*] Networking support
+      [*] Packet socket
+      [*] Unix domain sockets
+      [*] TCP/IP networking
+
+Guardá y salí (menuconfig pregunta). Te queda un .config nuevo.
+
+[aprender bash]
+  Buena práctica: guardá una copia de tu config para no perderla.
+    $ cp .config $MLX_ROOT/configs-mlx/kernel.config
+  (creá el dir configs-mlx primero)
+
+1.3 Compilar
+------------
+  $ make ARCH=x86 CROSS_COMPILE=$CROSS -j$(nproc) bzImage
+
+Tarda 2-5 minutos la primera vez. El producto:
+  arch/x86/boot/bzImage  ~ 1.5 MB
+
+1.4 Instalar headers del kernel al rootfs
+-----------------------------------------
+Los vamos a necesitar para que tcc, dentro del MiniLinux, pueda hacer
+"#include <linux/socket.h>" y similares.
+
+  $ make ARCH=x86 headers_install INSTALL_HDR_PATH=$MLX_ROOTFS/usr
+
+[checkpoint]
+  $ ls $MLX_ROOTFS/usr/include/linux/ | head
+  Debe haber decenas de archivos .h.
+
+1.5 Copiar el kernel al ISO
+---------------------------
+  $ cp arch/x86/boot/bzImage $MLX_ISO/isolinux/
+
+[concepto]
+  El bzImage no es un ELF común. Es "bzImage = header de setup + vmlinux
+  comprimido". ISOLINUX lo entiende y lo ejecuta correctamente.
+
+
+================================================================================
+  PARTE 2 - BUSYBOX
+================================================================================
+
+BusyBox es el 80% de tu userland.
+
+2.1 Bajar y preparar
+--------------------
+  $ cd $MLX_SRC
+  $ wget https://busybox.net/downloads/busybox-1.36.1.tar.bz2
+  $ tar -xf busybox-1.36.1.tar.bz2 -C $MLX_STAGE
+  $ cd $MLX_STAGE/busybox-1.36.1
+
+2.2 Configurar
+--------------
+Partimos del defconfig y editamos:
+
+  $ make defconfig
+
+[parche obligatorio en Ubuntu 26.04 / GCC 15]
+  El script scripts/kconfig/lxdialog/check-lxdialog.sh de busybox 1.36
+  tiene DOS bugs latentes que GCC 15 destapa:
+  (1) el programa de test usa 'main() {}' (K&R, sin tipo de retorno).
+      GCC 15 por defecto usa C23 y eso ES ERROR, no warning.
+  (2) make pasa -DCURSES_LOC="<ncurses.h>" al script como argumento,
+      pero bash consume las comillas dobles antes de que el script las
+      vea; cuando el script ejecuta el compilador, el "<" se interpreta
+      como redirección y el header se pierde. Esquivarlo con 'eval'
+      tampoco sirve porque las comillas ya se evaporaron.
+  El mensaje falso que muestra es "ncurses libraries not found", lo cual
+  despista completamente. Fix con dos sed:
+
+  $ sed -i 's/main() {}/int main(void){return 0;}/' \
+      scripts/kconfig/lxdialog/check-lxdialog.sh
+  $ sed -i 's|#include CURSES_LOC|#include <ncurses.h>|' \
+      scripts/kconfig/lxdialog/check-lxdialog.sh
+
+  La segunda línea reemplaza la indirección 'CURSES_LOC' por un include
+  directo. Perdemos flexibilidad (no sirve si tus headers están en otro
+  path) pero en Ubuntu está exactamente en /usr/include/ncurses.h.
+
+  Ahora sí:
+
+  $ (unset CC CXX AR LD STRIP RANLIB; make HOSTCC=gcc CC=gcc menuconfig)
+
+[concepto importante: por qué HOSTCC=gcc CC=gcc acá]
+  El 'menuconfig' de busybox compila una herramienta TUI con ncurses
+  que corre en TU Ubuntu (no en el target). Internamente consulta
+  "$CC -print-file-name=libncurses.so" para localizar la lib del host.
+  Como vos exportaste CC=i486-linux-musl-gcc en env.sh, ese CC apunta
+  al cross-compiler, cuyo sysroot NO tiene ncurses, y falla con:
+    *** 'make menuconfig' requires the ncurses libraries.
+  Pasándole HOSTCC=gcc CC=gcc le decimos "para esta invocación, usa
+  el gcc del host". El kernel no sufre esto porque su Makefile usa
+  HOSTCC consistentemente. Busybox 1.36 tiene ese detalle.
+
+  Alternativa equivalente:
+    $ (unset CC CXX AR LD STRIP RANLIB; make menuconfig)
+
+  CUANDO PASES A 'make' PARA COMPILAR DE VERDAD, volvés al env normal
+  con el cross exportado. El override es solo para menuconfig.
+
+Cambios importantes (ver ARQUITECTURA.txt 3.3):
+
+  Settings:
+    [*] Build static binary (no shared libs)
+    (Cross Compiler prefix) i486-linux-musl-
+    (Installation prefix) ./_install           # no lo cambiás acá, usamos
+                                                 CONFIG_PREFIX=... en make
+
+  Init Utilities:
+    [*] init
+      [*]   Support reading an inittab file
+    [*] getty                                    # CRITICO: sin esto no
+                                                 # hay como loguearse. Verificalo
+                                                 # con:  grep CONFIG_GETTY .config
+                                                 # debe decir CONFIG_GETTY=y.
+
+  Login/Password Management:
+    [*] login
+    [*] passwd
+    [*] su
+    [*] addgroup, adduser, deluser, delgroup (si querés gestionar usuarios
+         desde dentro)
+
+  Networking Utilities:
+    [*] ifconfig
+    [*] route
+    [*] ping
+    [*] nc
+    [*] wget
+    [*] telnet
+    [*] telnetd
+    [*] tftp
+    [*] udhcpc (DHCP client)
+    [*] httpd
+      [*] Support ranges (HTTP Range: header)
+      [*] Support setuid
+
+  Editors:
+    [*] vi
+      [*] Enable regexp, undo, autoindent, extended regex, etc.
+
+  Shells:
+    [*] ash
+      [*] Enable job control, aliases, command history
+
+[concepto]
+  'Static' hace que el binario no dependa de .so externos. Es crítico porque
+  el rootfs NO tiene libc instalada como .so.
+
+  CROSS_COMPILE le dice a busybox usar i486-linux-musl-gcc. Si lo setteás
+  en el config, no hace falta pasárselo en la línea de make. Sin embargo,
+  conviene ser explícito.
+
+Guardá.
+
+2.3 Compilar
+------------
+[parche obligatorio para BusyBox 1.36 + musl static]
+  Antes de compilar, desactivá el acelerador SHA-NI (instrucciones HW de
+  SHA1/SHA256). Su asm x86-32 genera relocations en segmento read-only,
+  lo cual con '-static' sobre musl produce:
+    ld: read-only segment has dynamic relocations
+  Y el link falla. No es un bug tuyo, es upstream. Fix:
+
+  $ sed -i 's|^CONFIG_SHA256_HWACCEL=y|# CONFIG_SHA256_HWACCEL is not set|' .config
+  $ sed -i 's|^CONFIG_SHA1_HWACCEL=y|# CONFIG_SHA1_HWACCEL is not set|' .config
+
+  (o en menuconfig: Settings -> Build Options -> [ ] SHA1 hardware
+   acceleration, [ ] SHA256 hardware acceleration.)
+  La pérdida de performance es despreciable en nuestra escala.
+
+  $ make CROSS_COMPILE=$CROSS -j$(nproc)
+  $ make CROSS_COMPILE=$CROSS CONFIG_PREFIX=$MLX_ROOTFS install
+
+Lo que hizo 'install':
+  - Copió el binario busybox a $MLX_ROOTFS/bin/busybox
+  - Creó symlinks (ls, cat, sh, mount, etc.) apuntando a busybox
+  - Pobló bin/ sbin/ usr/bin/ usr/sbin/
+
+[checkpoint]
+  $ file $MLX_ROOTFS/bin/busybox
+  Debe decir: ELF 32-bit LSB executable, Intel i386, statically linked.
+
+  $ $MLX_ROOTFS/bin/busybox | head
+  (podés ejecutarlo en tu host; es i386 estático, corre).
+
+[concepto: merged-usr]
+  Después vamos a reorganizar: /bin -> /usr/bin, /sbin -> /usr/sbin.
+  Por ahora dejalo como salió de busybox. Al final, antes de empaquetar,
+  haremos la fusión.
+
+
+================================================================================
+  PARTE 3 - NCURSES (dep de build para nano y joe)
+================================================================================
+
+[concepto importante]
+  Ncurses es DEP DE BUILD, no de runtime. Sus libs .a van a quedar EMBEBIDAS
+  dentro de los binarios de nano/joe por el linkado estático. En el rootfs
+  final NO vamos a tener libncurses.so ni libncurses.a instaladas.
+
+  Pero sí va a estar el "terminfo" -los archivos de datos- que ncurses
+  necesita leer en runtime para saber qué secuencias de escape manda cada
+  terminal.
+
+3.1 Bajar
+---------
+  $ cd $MLX_SRC
+  $ wget https://invisible-mirror.net/archives/ncurses/ncurses-6.4.tar.gz
+  $ tar -xf ncurses-6.4.tar.gz -C $MLX_STAGE
+  $ cd $MLX_STAGE/ncurses-6.4
+
+3.2 Configurar y compilar
+-------------------------
+Queremos una instalación "fake" en staging/ncurses-prefix/, SOLO para
+que los builds de nano y joe la encuentren. NO se copia a rootfs.
+
+  $ export NCPREFIX=$MLX_STAGE/ncurses-prefix
+  $ mkdir -p $NCPREFIX
+
+  $ CFLAGS="$MLX_CFLAGS" CPPFLAGS="-P" LDFLAGS="$MLX_LDFLAGS" \
+    ./configure \
+      --host=$HOST_TRIPLET \
+      --prefix=$NCPREFIX \
+      --without-shared --enable-static \
+      --without-ada --without-tests --without-manpages --without-progs \
+      --without-cxx --without-cxx-binding --without-pkg-config \
+      --with-termlib=tinfo \
+      --disable-db-install \
+      --enable-widec=no \
+      --enable-overwrite \
+      --with-default-terminfo-dir=/usr/share/terminfo \
+      --with-terminfo-dirs=/usr/share/terminfo
+
+[concepto: --enable-overwrite]
+  Por default, ncurses instala sus headers bajo $prefix/include/ncurses/,
+  para que ncurses "narrow" (curses.h) y "wide" (ncursesw/curses.h) puedan
+  convivir. Pero muchos paquetes que dependen de ncurses escriben
+  '#include <curses.h>' esperándolo en la raíz del include path.
+  --enable-overwrite instala los headers en $prefix/include/ directamente.
+  Simplifica el linkado de nano, joe y cualquier otro cliente.
+
+  Si ya compilaste ncurses SIN esa flag y no querés rebuildear, un atajo
+  equivalente es poblar el include raíz con symlinks al subdir:
+    $ cd $NCPREFIX/include && for h in ncurses/*.h; do
+        ln -sf "$h" "$(basename "$h")"
+      done
+
+  $ make -j$(nproc)
+  $ make install
+
+[concepto: --with-default-terminfo-dir]
+  Aun cuando NO copiamos ncurses al rootfs, ESE valor queda cocido en los
+  binarios que se linkan contra él. Nano/joe van a buscar terminfo en
+  /usr/share/terminfo del target. Por eso lo apuntamos a esa ruta del
+  rootfs final.
+
+3.3 Generar un mini terminfo para el rootfs
+-------------------------------------------
+ncurses viene con el compilador 'tic' de terminfo, y la base en terminfo.src.
+
+  $ mkdir -p $MLX_ROOTFS/usr/share/terminfo
+  $ TERMINFO=$MLX_ROOTFS/usr/share/terminfo \
+    tic -x -o $MLX_ROOTFS/usr/share/terminfo \
+      $MLX_STAGE/ncurses-6.4/misc/terminfo.src
+
+[concepto: por qué 'tic' del host y no del cross]
+  Las "programs" de ncurses (tic, infocmp, tput, toe...) son herramientas
+  que corren en EL HOST para manipular terminfo, no en el target. Por eso
+  configure recibió --without-progs: cross-compilarlas era desperdicio.
+  Ubuntu ya trae /usr/bin/tic con el paquete ncurses-bin (instalado como
+  dependencia de ncurses-base/libncurses-dev). Las entries binarias que
+  produce son compatibles con ncurses 6.x, así que son consumibles por
+  los nano/joe del target.
+
+Eso compila el DB ENTERO (~6 MB). Para reducir, podemos borrar las letras
+que no usamos:
+
+  $ cd $MLX_ROOTFS/usr/share/terminfo
+  $ ls
+  (ves carpetas 1, 2, ..., a, b, ..., v, x, ...)
+  $ rm -rf [0-9]
+  $ for letra in a b c d e f g h i j k m n o p q r s t u w y z; do
+      rm -rf $letra
+    done
+  (dejamos solo l, v, x: linux, vt100, xterm, xterm-256color, screen)
+  (ojo: screen empieza con s, no borrar la s si lo querés)
+
+Alternativa más limpia: compilar solo las que querés:
+
+  $ cd $MLX_STAGE/ncurses-6.4/misc
+  $ grep -A5 "^linux|" terminfo.src > /tmp/mini.ti
+  $ grep -A5 "^xterm|" terminfo.src >> /tmp/mini.ti
+  $ grep -A5 "^xterm-256color|" terminfo.src >> /tmp/mini.ti
+  $ grep -A5 "^vt100|" terminfo.src >> /tmp/mini.ti
+  $ tic -x -o $MLX_ROOTFS/usr/share/terminfo /tmp/mini.ti
+
+[checkpoint]
+  $ ls $MLX_ROOTFS/usr/share/terminfo/l/
+  Debe estar linux (binario de ~2 KB).
+  $ ls $MLX_ROOTFS/usr/share/terminfo/x/
+  Debe estar xterm y xterm-256color.
+
+
+================================================================================
+  PARTE 4 - BASH
+================================================================================
+
+4.1 Bajar
+---------
+  $ cd $MLX_SRC
+  $ wget https://ftp.gnu.org/gnu/bash/bash-5.2.tar.gz
+  $ tar -xf bash-5.2.tar.gz -C $MLX_STAGE
+  $ cd $MLX_STAGE/bash-5.2
+
+4.2 Compilar
+------------
+  $ CFLAGS="$MLX_CFLAGS -static" LDFLAGS="-static" \
+    ./configure \
+      --host=$HOST_TRIPLET \
+      --prefix=/usr \
+      --without-bash-malloc \
+      --enable-static-link \
+      --disable-nls \
+      --disable-rpath \
+      --disable-help-builtin
+
+[parche obligatorio para bash 5.2 + musl static + cross]
+  Durante configure, bash hace DOS checks sobre strtoimax:
+  (1) AC_CHECK_FUNC: ¿existe strtoimax? -> sí (musl la provee).
+  (2) AC_RUN_IFELSE: ¿funciona correctamente? -> ejecuta un test.
+  En cross-compile, un AC_RUN_IFELSE no puede correr el binario target,
+  entonces por defecto responde "no" (cache miss). Resultado: bash
+  decide "la libc tiene strtoimax pero está bugueada, usá la mía",
+  y agrega lib/sh/strtoimax.o a LIBOBJS. Al linkar -static, ese objeto
+  Y el de musl terminan en el mismo binario -> "multiple definition".
+
+  Fix: sacar strtoimax de LIBOBJS en lib/sh/Makefile y relinkar.
+
+  $ sed -i 's|\${LIBOBJDIR}strtoimax\$U\.o||' lib/sh/Makefile
+  $ rm -f lib/sh/strtoimax.o lib/sh/libsh.a bash
+
+  Ahora sí:
+
+  $ make -j$(nproc)
+  $ $STRIP bash
+
+  $ cp bash $MLX_ROOTFS/usr/bin/bash
+
+[concepto: --without-bash-malloc]
+  Bash trae su propio malloc que asume detalles de glibc. Con musl rompe.
+  --without-bash-malloc le dice "usá el malloc de la libc", que acá es musl.
+
+[checkpoint]
+  $ file $MLX_ROOTFS/usr/bin/bash
+  Debe decir statically linked, ~1 MB.
+
+
+================================================================================
+  PARTE 5 - NANO
+================================================================================
+
+5.1 Bajar
+---------
+  $ cd $MLX_SRC
+  $ wget https://www.nano-editor.org/dist/v7/nano-7.2.tar.xz
+  $ tar -xf nano-7.2.tar.xz -C $MLX_STAGE
+  $ cd $MLX_STAGE/nano-7.2
+
+5.2 Compilar linkando contra ncurses del staging
+------------------------------------------------
+  $ CFLAGS="$MLX_CFLAGS -static -I$NCPREFIX/include" \
+    LDFLAGS="-static -L$NCPREFIX/lib" \
+    CURSES_LIB_NAME="ncurses" \
+    CURSES_LIB="-lncurses -ltinfo" \
+    ./configure \
+      --host=$HOST_TRIPLET \
+      --prefix=/usr \
+      --sysconfdir=/etc \
+      --enable-tiny \
+      --disable-nls \
+      --disable-utf8
+
+  $ make -j$(nproc)
+  $ $STRIP src/nano
+  $ cp src/nano $MLX_ROOTFS/usr/bin/nano
+
+5.3 Instalar los syntax files
+-----------------------------
+Nano trae syntax highlighting en syntax/ .nanorc. Vamos a llevar los más
+útiles:
+
+  $ mkdir -p $MLX_ROOTFS/usr/share/nano
+  $ cp syntax/{c,sh,python,lua,html,css,javascript,makefile,xml,yaml}.nanorc \
+       $MLX_ROOTFS/usr/share/nano/ 2>/dev/null
+  (algunos pueden no existir en 7.2 tiny; los que no, borrar del comando)
+
+5.4 /etc/nanorc
+---------------
+Lo vas a escribir vos. Es un archivo de texto plano. Documentación:
+'man nanorc' en tu Ubuntu, o la que dejó el build en doc/sample.nanorc.
+
+[[hint para /etc/nanorc]]
+  - Línea 'include "/usr/share/nano/*.nanorc"' activa todos los syntax files.
+  - 'set autoindent', 'set linenumbers', 'set tabsize 4', 'set tabstospaces'.
+  - 'set mouse' si querés usar el ratón (en QEMU no es trivial, dejalo off).
+  - 'bind' para keybindings custom.
+
+Lo guardás en $MLX_ROOTFS/etc/nanorc.
+
+
+================================================================================
+  PARTE 6 - JOE
+================================================================================
+
+6.1 Bajar
+---------
+  $ cd $MLX_SRC
+  $ wget https://sourceforge.net/projects/joe-editor/files/JOE%20sources/joe-4.6/joe-4.6.tar.gz
+  $ tar -xf joe-4.6.tar.gz -C $MLX_STAGE
+  $ cd $MLX_STAGE/joe-4.6
+
+6.2 Compilar
+------------
+  $ CFLAGS="$MLX_CFLAGS -static -I$NCPREFIX/include" \
+    LDFLAGS="-static -L$NCPREFIX/lib" \
+    ./configure \
+      --host=$HOST_TRIPLET \
+      --prefix=/usr \
+      --sysconfdir=/etc
+
+  $ make -j$(nproc)
+  $ make install DESTDIR=$MLX_STAGE/joe-install
+
+  $ cp $MLX_STAGE/joe-install/usr/bin/joe $MLX_ROOTFS/usr/bin/
+  $ $STRIP $MLX_ROOTFS/usr/bin/joe
+
+Joe se "disfraza" con el nombre con que lo invocás. Creamos los symlinks:
+
+  $ cd $MLX_ROOTFS/usr/bin
+  $ ln -sf joe jmacs
+  $ ln -sf joe jpico
+  $ ln -sf joe jstar
+  $ ln -sf joe rjoe
+
+6.3 Configs
+-----------
+  $ mkdir -p $MLX_ROOTFS/etc/joe
+  $ cp $MLX_STAGE/joe-install/etc/joe/*.jsf $MLX_ROOTFS/etc/joe/
+  $ cp $MLX_STAGE/joe-install/etc/joe/joerc $MLX_ROOTFS/etc/joe/joerc
+
+Después podés editar joerc desde adentro del MiniLinux cuando quieras
+cambiar keybindings, colores, etc.
+
+
+================================================================================
+  PARTE 7 - TCC
+================================================================================
+
+7.1 Bajar
+---------
+  $ cd $MLX_SRC
+  $ wget https://fosszone.csd.auth.gr/nongnu/tinycc/tcc-0.9.27.tar.bz2
+  $ tar -xf tcc-0.9.27.tar.bz2 -C $MLX_STAGE
+  $ cd $MLX_STAGE/tcc-0.9.27
+
+7.2 Configurar y compilar en modo cross
+---------------------------------------
+tcc cross es raro. Vamos a construir un tcc nativo i386 usando nuestro
+cross-gcc:
+
+  $ ./configure \
+      --prefix=/usr \
+      --cpu=i386 \
+      --cc=$CC \
+      --ar=$AR \
+      --strip=$STRIP \
+      --triplet=i486-linux-musl \
+      --extra-cflags="-static" \
+      --extra-ldflags="-static" \
+      --config-musl
+
+  $ make cross-i386
+
+Eso produce i386-tcc. Lo renombramos:
+
+  $ cp i386-tcc $MLX_ROOTFS/usr/bin/tcc
+  $ $STRIP $MLX_ROOTFS/usr/bin/tcc
+
+7.3 Instalar runtime libs de tcc
+---------------------------------
+  $ mkdir -p $MLX_ROOTFS/usr/lib/tcc
+  $ cp libtcc1.a $MLX_ROOTFS/usr/lib/tcc/ 2>/dev/null || \
+    find . -name libtcc1.a -exec cp {} $MLX_ROOTFS/usr/lib/tcc/ \;
+
+7.4 Headers y libs de musl para DENTRO del MiniLinux
+-----------------------------------------------------
+Para que 'tcc hello.c -o hello' funcione dentro del target, hay que
+proveerle musl headers y las libs estáticas:
+
+  $ cp -r $MLX_SYSROOT/include/* $MLX_ROOTFS/usr/include/
+  $ mkdir -p $MLX_ROOTFS/usr/lib
+  $ cp $MLX_SYSROOT/lib/{libc.a,libm.a,libpthread.a} $MLX_ROOTFS/usr/lib/ 2>/dev/null
+  $ cp $MLX_SYSROOT/lib/{crt1.o,crti.o,crtn.o,Scrt1.o} $MLX_ROOTFS/usr/lib/ 2>/dev/null
+
+[checkpoint - cuando booteemos]
+  <tu># cat > hello.c <<EOF
+  #include <stdio.h>
+  int main(void) { puts("hola desde tcc"); return 0; }
+  EOF
+  <tu># tcc hello.c -o hello
+  <tu># ./hello
+
+
+================================================================================
+  PARTE 8 - LUA 5.4
+================================================================================
+
+8.1 Bajar
+---------
+  $ cd $MLX_SRC
+  $ wget https://www.lua.org/ftp/lua-5.4.6.tar.gz
+  $ tar -xf lua-5.4.6.tar.gz -C $MLX_STAGE
+  $ cd $MLX_STAGE/lua-5.4.6
+
+8.2 Compilar
+------------
+Lua no usa autoconf. Su Makefile acepta flags así:
+
+  $ make linux CC=$CC AR="$AR rcu" RANLIB=$RANLIB \
+             MYCFLAGS="$MLX_CFLAGS -static" \
+             MYLDFLAGS="-static" \
+             MYLIBS=""
+
+  $ make install INSTALL_TOP=$MLX_ROOTFS/usr \
+                INSTALL_BIN=$MLX_ROOTFS/usr/bin \
+                INSTALL_LIB=$MLX_ROOTFS/usr/lib \
+                INSTALL_INC=$MLX_ROOTFS/usr/include \
+                INSTALL_LMOD=$MLX_ROOTFS/usr/share/lua/5.4 \
+                INSTALL_CMOD=$MLX_ROOTFS/usr/lib/lua/5.4
+
+  $ $STRIP $MLX_ROOTFS/usr/bin/lua
+  $ $STRIP $MLX_ROOTFS/usr/bin/luac
+
+[concepto: MYLIBS vacío]
+  Por defecto lua Linux target linkea con -lreadline -lhistory -lncurses.
+  Como no queremos esas deps, MYLIBS="" las saca y quedamos con el REPL
+  básico (sin historia editable). Si te molesta, siempre podés llamar
+  "bash" y después 'lua archivo.lua'.
+
+
+================================================================================
+  PARTE 9 - MICROPYTHON
+================================================================================
+
+9.1 Bajar
+---------
+  $ cd $MLX_SRC
+  $ git clone --depth 1 --branch v1.22.0 \
+      https://github.com/micropython/micropython.git
+  $ cd micropython
+
+9.2 Compilar el puerto Unix
+----------------------------
+  $ make -C mpy-cross CC=gcc
+
+(mpy-cross es el "compilador de bytecode" y se compila con tu gcc nativo,
+no con el cross. Confuso pero correcto.)
+
+  $ cd ports/unix
+  $ make V=1 CC=$CC AR=$AR STRIP=$STRIP \
+         CFLAGS_EXTRA="-Os -static" \
+         LDFLAGS_EXTRA="-static" \
+         VARIANT=minimal
+
+  $ cp build-minimal/micropython $MLX_ROOTFS/usr/bin/micropython
+  $ $STRIP $MLX_ROOTFS/usr/bin/micropython
+
+[concepto: variants]
+  micropython/ports/unix/variants/ tiene presets. 'minimal' es el más chico.
+  'standard' trae más stdlib pero crece a ~800 KB.
+
+[checkpoint]
+  $ file $MLX_ROOTFS/usr/bin/micropython
+  statically linked, ~300-400 KB.
+
+
+================================================================================
+  PARTE 10 - DROPBEAR
+================================================================================
+
+10.1 Bajar
+----------
+  $ cd $MLX_SRC
+  $ wget https://matt.ucc.asn.au/dropbear/releases/dropbear-2024.86.tar.bz2
+  $ tar -xf dropbear-2024.86.tar.bz2 -C $MLX_STAGE
+  $ cd $MLX_STAGE/dropbear-2024.86
+
+10.2 Compilar
+-------------
+  $ CFLAGS="$MLX_CFLAGS -static" LDFLAGS="-static" \
+    ./configure \
+      --host=$HOST_TRIPLET \
+      --prefix=/usr \
+      --disable-zlib \
+      --disable-pam \
+      --disable-lastlog --disable-utmp --disable-utmpx \
+      --disable-wtmp --disable-wtmpx \
+      --disable-loginfunc
+
+  $ make PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp" \
+         CC=$CC STATIC=1 -j$(nproc)
+
+  $ cp dropbear dbclient dropbearkey dropbearconvert scp \
+       $MLX_ROOTFS/usr/bin/
+  $ $STRIP $MLX_ROOTFS/usr/bin/{dropbear,dbclient,dropbearkey,dropbearconvert,scp}
+
+  $ mv $MLX_ROOTFS/usr/bin/dropbear $MLX_ROOTFS/usr/sbin/dropbear
+
+También queremos 'ssh' como alias de dbclient:
+
+  $ ln -sf dbclient $MLX_ROOTFS/usr/bin/ssh
+
+
+================================================================================
+  PARTE 11 - RSYNC
+================================================================================
+
+11.1 Bajar
+----------
+Bajá la última estable desde https://rsync.samba.org/ (o un mirror).
+La guía asume la serie 3.5.x. Los flags de configure cambiaron desde
+la 3.2.x; si bajás una serie vieja, ajustá según su ./configure --help.
+
+  $ cd $MLX_SRC
+  $ wget https://download.samba.org/pub/rsync/rsync-3.5.2.tar.gz
+  $ tar -xf rsync-3.5.2.tar.gz -C $MLX_STAGE
+  $ cd $MLX_STAGE/rsync-3.5.2
+
+11.2 Compilar
+-------------
+  $ CFLAGS="$MLX_CFLAGS -static" LDFLAGS="-static" \
+    ./configure \
+      --host=$HOST_TRIPLET \
+      --prefix=/usr \
+      --disable-openssl \
+      --disable-xxhash --disable-zstd --disable-lz4 \
+      --disable-xattr-support --disable-acl-support \
+      --disable-iconv --disable-idn \
+      --disable-md2man --disable-openat2 \
+      --enable-md5-asm=no --enable-roll-asm=no --enable-roll-simd=no
+
+[concepto: cambios de flags entre 3.2.x y 3.5.x]
+  3.2.x usaba --disable-xattr y --disable-acl.
+  3.5.x los renombró a --disable-xattr-support y --disable-acl-support.
+  3.5.x agregó openat2, md5-asm, roll-asm, roll-simd, iconv: hay que
+  apagarlos para evitar código asm x86-32 que choca con static-PIE en
+  musl, o deps que no tenemos.
+
+  $ make -j$(nproc)
+  $ $STRIP rsync
+  $ cp rsync $MLX_ROOTFS/usr/bin/
+
+
+================================================================================
+  PARTE 12 - FUENTE CUSTOM MONOCRAFT (opcional, barato)
+================================================================================
+
+12.1 Convertir la TTC a PSF2
+----------------------------
+El kernel necesita fuentes en formato PSF/PSF2 (binario con glyphs bitmap).
+Monocraft es TTF; hay que rasterizarla. Usamos fontforge para TTC->TTF,
+otf2bdf para TTF->BDF, y bdf2psf para BDF->PSF2.
+
+  $ cd $MLX_STAGE
+  $ mkdir -p font && cd font
+
+  (a) Extraer la TTF de dentro de la TTC:
+
+  $ fontforge -lang=ff -c \
+      'Open($1); Generate($2); Quit(0);' \
+      "$HOME/.local/share/fonts/Monocraft-nerd-fonts-patched.ttc(Monocraft)" \
+      monocraft.ttf
+
+  (Si falla porque dentro de la TTC el nombre interno es otro, probá:
+   $ fontforge -lang=ff -c 'Print($1)' tu-archivo.ttc 2>&1 | head
+   para ver los nombres.)
+
+  (b) Rasterizar a BDF 7x16:
+
+  $ otf2bdf -p 11 -r 72 -o monocraft-7x16.bdf monocraft.ttf
+
+  [nota 1] otf2bdf devuelve un exit code != 0 (ej: 8) para WARNINGS, no
+  solo para errores. Con Nerd Fonts es esperable: hay miles de glyphs
+  patch que no caben en el bitmap target o no tienen outlines. Si
+  'file monocraft-7x16.bdf' dice "X11 BDF font" y empieza con STARTFONT
+  y termina con ENDFONT, el archivo es usable.
+
+  [nota 2] ¿Por qué pt=11 y no pt=16? bdf2psf exige que la métrica
+  AVERAGE_WIDTH del BDF (guardada como 10x el ancho real en píxeles) sea
+  divisible por 10, es decir, que el ancho sea un entero exacto. Con
+  Monocraft a pt=16, AVERAGE_WIDTH queda en 105 (10.5 px, no entero) y
+  bdf2psf aborta con "the width is not integer number". La única
+  combinación que da enteros naturales en el rango útil es pt=11 r=72:
+  AW=70 -> 7 px de ancho, 16 de alto. La consola de Linux (fbcon)
+  acepta anchos 1-32 sin problema, así que una fuente 7x16 renderiza
+  perfectamente.
+
+  (c) Convertir a PSF2:
+
+  $ bdf2psf --fb monocraft-7x16.bdf \
+      /usr/share/bdf2psf/standard.equivalents \
+      /usr/share/bdf2psf/ascii.set+/usr/share/bdf2psf/useful.set+/usr/share/bdf2psf/linux.set \
+      256 monocraft-7x16.psf
+
+  [nota] bdf2psf parte el 3er argumento por '+' en una lista de archivos,
+  pero cada uno lo abre tal cual (NO concatena el prefijo del primero).
+  Por eso hay que repetir /usr/share/bdf2psf/ en cada entrada. Si no,
+  falla con "useful.set: No such file or directory".
+
+  $ mkdir -p $MLX_ROOTFS/usr/share/consolefonts
+  $ cp monocraft-7x16.psf $MLX_ROOTFS/usr/share/consolefonts/
+
+12.2 Cargarla en boot
+---------------------
+Más tarde, en el script rcS vas a agregar:
+
+  setfont /usr/share/consolefonts/monocraft-7x16.psf 2>/dev/null
+
+(busybox tiene 'setfont' si lo habilitaste en menuconfig. Si no, también
+podés usar 'loadfont < /path/to.psf'.)
+
+================================================================================
+  >>> RECORDATORIO <<<
+  Cuando estés escribiendo /etc/init.d/rcS en la Parte 14.11, VOLVÉ ACÁ
+  para copiar la línea 'setfont ...' de arriba. En la Parte 14.11 vas a
+  ver el marcador [RECORDATORIO MONOCRAFT] indicando dónde ponerla.
+================================================================================
+
+[concepto: por qué setfont funciona sin X]
+  La consola de linux-fb es un framebuffer con un emulador de VT en el
+  kernel. Las PSF se cargan con un ioctl y se renderizan por hw sin
+  intervención de userland.
+
+Si algo no funciona, saltate esta sección. El sistema booteará con la
+fuente VGA 8x16 clásica, no es pérdida importante.
+
+
+================================================================================
+  PARTE 13 - FUSIONAR /bin y /usr/bin (merged-usr)
+================================================================================
+
+Para simplificar, hacemos que /bin, /sbin y /lib apunten a /usr/*.
+
+  $ cd $MLX_ROOTFS
+
+Primero pasamos todo lo que quedó en bin/sbin/lib hacia usr/:
+
+  $ [ -d bin ]  && cp -an bin/*  usr/bin/  2>/dev/null
+  $ [ -d sbin ] && cp -an sbin/* usr/sbin/ 2>/dev/null
+  $ [ -d lib ]  && cp -an lib/*  usr/lib/  2>/dev/null
+  $ rm -rf bin sbin lib
+
+Ahora creamos los symlinks:
+
+  $ ln -s usr/bin bin
+  $ ln -s usr/sbin sbin
+  $ ln -s usr/lib lib
+
+[concepto: por qué -an y no simplemente -a]
+  -a preserva modos y recursión. -n (no-clobber) evita sobreescribir si
+  ya existe algo con ese nombre en destino. Así el symlink de busybox-install
+  (si creó ls -> ../bin/busybox) sigue siendo válido.
+
+[concepto: por qué el guard '[ -d X ] &&']
+  zsh por default aborta un comando si un glob no matchea nada
+  (opción NOMATCH). lib/ posiblemente no existe (ningún paquete creó
+  uno en el raíz del rootfs; todo lo que va a lib está bajo usr/lib).
+  El '[ -d lib ] && ...' corta la evaluación si el dir no existe, y así
+  el glob nunca se intenta expandir. En bash el patrón también anda bien
+  (fail-closed correcto). Lo mismo para bin y sbin por simetría.
+
+[checkpoint]
+  $ ls -la $MLX_ROOTFS/bin $MLX_ROOTFS/sbin $MLX_ROOTFS/lib
+  Los tres deben ser symlinks a usr/*.
+
+
+================================================================================
+  PARTE 14 - EL /etc Y LOS SCRIPTS (acá escribís VOS)
+================================================================================
+
+Hasta ahora copiamos binarios. Un sistema sin /etc poblado no bootea.
+Aquí es donde empezás a escribir bash, con pistas.
+
+14.1 Esqueleto de /etc
+----------------------
+  $ mkdir -p $MLX_ROOTFS/etc/{init.d,dropbear}
+  $ mkdir -p $MLX_ROOTFS/{home,root,var/log,var/www,run,mnt,opt,proc,sys,tmp,dev}
+
+14.2 /etc/hostname
+------------------
+Un archivo con una línea:
+
+  minilinux
+
+Escribilo:
+
+  $ echo "minilinux" > $MLX_ROOTFS/etc/hostname
+
+14.3 /etc/hosts
+---------------
+Formato: <IP>  <nombre1> <nombre2> ...
+Tiene que tener como mínimo la resolución de localhost.
+
+[[hint]]
+  - Una línea para 127.0.0.1 y otra para ::1.
+  - Agregá 'minilinux' como alias de 127.0.0.1.
+
+14.4 /etc/resolv.conf
+---------------------
+DNS fallback por si no hay DHCP. Formato:
+
+  nameserver <ip>
+
+[[hint]]
+  - 1.1.1.1 y 8.8.8.8 son buenos defaults.
+
+14.5 /etc/passwd y /etc/shadow
+-------------------------------
+/etc/passwd formato (una entrada por usuario):
+  nombre:x:UID:GID:GECOS:home:shell
+
+Vos querés dos usuarios:
+  - root (UID 0, home /root, shell /bin/sh)
+  - user (UID 1000, home /home/user, shell /bin/bash)
+
+[[hint para passwd]]
+  - La 'x' indica que la contraseña está en /etc/shadow.
+  - GECOS podés dejarlo vacío (dos :: consecutivos).
+
+/etc/shadow formato:
+  nombre:hash:ultimo_cambio:min:max:warn:inact:exp:res
+
+Para generar el hash de "minilinux" podés usar busybox mkpasswd o el de
+Ubuntu:
+
+  $ mkpasswd -m sha-512 minilinux
+  (si no existe mkpasswd, instalá whois o usá python3 -c ...)
+
+Pegá ese hash en la segunda columna.
+
+/etc/group:
+  nombre:x:GID:lista_miembros
+
+Mínimo: root:x:0: y user:x:1000:
+
+Cuando los tengas escritos:
+
+  $ chmod 644 $MLX_ROOTFS/etc/passwd $MLX_ROOTFS/etc/group
+  $ chmod 600 $MLX_ROOTFS/etc/shadow
+
+Y creá el home:
+
+  $ mkdir -p $MLX_ROOTFS/home/user
+  $ chmod 755 $MLX_ROOTFS/home/user
+
+14.6 /etc/shells
+----------------
+Lista los shells válidos. Una línea por shell:
+
+  /bin/sh
+  /bin/bash
+
+14.7 /etc/profile
+-----------------
+Script que corre al hacer login. Vos lo escribís. Estructura esperada:
+
+  #!/bin/sh
+  export PATH=...
+  export HOME=${HOME:-/root}   # si HOME no está definido, /root
+  export TERM=${TERM:-linux}
+  export EDITOR=nano
+  export PS1='\u@\h:\w\$ '     # user@host:cwd$
+  alias ls='ls --color=auto'
+  alias ll='ls -lah'
+  alias grep='grep --color=auto'
+  umask 022
+
+[[hint bash para PS1]]
+  '\u' = usuario, '\h' = hostname, '\w' = cwd. Si querés colores,
+  podés inyectar códigos ANSI: \[\e[32m\]\u@\h\[\e[0m\]:\w\$
+  Los \[ \] le dicen a readline "esto no cuenta para el ancho visible".
+
+14.8 /etc/fstab
+---------------
+Documenta qué se monta dónde. Formato:
+  <device>  <mount>  <type>  <options>  <dump>  <pass>
+
+[[escribí vos]]
+  - proc en /proc, tipo proc
+  - sysfs en /sys, tipo sysfs
+  - devtmpfs en /dev, tipo devtmpfs
+  - devpts en /dev/pts, tipo devpts
+  - tmpfs en /tmp, tipo tmpfs
+  - tmpfs en /run, tipo tmpfs
+
+Options "defaults" alcanza para todos. Dump y pass = 0 0.
+
+14.9 /etc/inittab
+-----------------
+Este lo escribís con cuidado. Formato busybox:
+  <id>:<runlevels>:<action>:<process>
+
+Los runlevels se ignoran en busybox init; podés dejarlos vacíos.
+Actions que vas a usar: sysinit, respawn, ctrlaltdel, shutdown.
+
+[[escribilo con esta lógica]]
+  - sysinit: /etc/init.d/rcS (corre una vez al arrancar, init espera)
+  - respawn: getty en tty1 (y opcionalmente tty2, tty3, ttyS0)
+  - ctrlaltdel: reboot (Ctrl+Alt+Del hace reboot limpio)
+  - shutdown: /etc/init.d/rcK (corre al apagar)
+
+[concepto: ¿por qué los getty?]
+  'getty tty1' abre tty1, imprime login, cuando alguien escribe lo pasa a
+  login que pide password y después exec al shell del usuario. Si no hay
+  getty, el sistema bootea pero no tenés dónde escribir.
+
+14.10 /etc/motd
+---------------
+"Message of the day", se imprime después del login (si el shell lo
+muestra; bash lo hace si se lo pedís desde profile).
+
+Una buena motd dice qué sistema es, versión, y tips de uso. Es tu
+bienvenida. Escribila como texto plano.
+
+14.11 /etc/init.d/rcS - LO IMPORTANTE
+-------------------------------------
+Este script monta filesystems virtuales y levanta servicios. Lo escribís
+vos. Estructura paso a paso que tiene que cumplir:
+
+  #!/bin/sh
+  # 1) Mount /proc: info del kernel
+  # 2) Mount /sys: sysfs
+  # 3) Mount /dev (devtmpfs) si no lo hizo el kernel
+  # 4) mkdir /dev/pts si no existe, mount devpts
+  # 5) Mount /tmp y /run como tmpfs
+  # 6) echo /sbin/mdev > /proc/sys/kernel/hotplug  (para hotplug dinámico)
+  # 7) mdev -s (pobla /dev con lo que hay en /sys)
+  # 8) hostname desde /etc/hostname
+  # 9) ifconfig lo 127.0.0.1 up
+  # 10) Lanzar /etc/init.d/network start  en background
+  # 11) Lanzar /etc/init.d/dropbear start en background
+  # 12) [RECORDATORIO MONOCRAFT] Cargar fuente de consola:
+  #     setfont /usr/share/consolefonts/monocraft-7x16.psf 2>/dev/null
+  #     (volvé a la Parte 12.2 si necesitás contexto)
+  # 13) Opcional: cat /etc/motd
+
+[[sintaxis bash útil que necesitás]]
+  - 'mount -t <tipo> <dispositivo> <punto>' para montar.
+    Para pseudo-fs el <dispositivo> es un nombre simbólico (ej: 'proc').
+  - '2>/dev/null' descarta errores de un comando.
+  - 'comando &' corre en background.
+  - 'if [ ! -d /dev/pts ]; then mkdir /dev/pts; fi' para crear si no existe.
+    Equivalente más corto: '[ -d /dev/pts ] || mkdir /dev/pts'
+  - 'echo texto > /path/file' escribe texto al archivo.
+
+Guardalo y:
+  $ chmod +x $MLX_ROOTFS/etc/init.d/rcS
+
+14.12 /etc/init.d/rcK (shutdown)
+--------------------------------
+Script corto que:
+  - Para dropbear (killall dropbear)
+  - sync (vuelca buffers)
+  - Desmonta todo lo que pueda
+
+[[escribilo con estos pasos]]
+  #!/bin/sh
+  killall dropbear 2>/dev/null
+  killall udhcpc 2>/dev/null
+  sync
+  umount -a -r   # -r remonta read-only lo que no se puede desmontar
+
+  $ chmod +x $MLX_ROOTFS/etc/init.d/rcK
+
+14.13 /etc/init.d/network
+-------------------------
+Pedido por rcS. Debe aceptar 'start' y 'stop'.
+
+  #!/bin/sh
+  case "$1" in
+    start)
+      ifconfig eth0 up
+      udhcpc -i eth0 -b -q -t 5 >/dev/null 2>&1
+      ;;
+    stop)
+      killall udhcpc 2>/dev/null
+      ifconfig eth0 down
+      ;;
+    *)
+      echo "uso: $0 {start|stop}"
+      ;;
+  esac
+
+[aprender bash: case]
+  'case "$1" in patron) comandos ;; otro) comandos ;; esac'
+  $1 es el primer argumento. 'start)' matchea literalmente la palabra start.
+  '*' matchea cualquier cosa (fallback).
+
+  $ chmod +x $MLX_ROOTFS/etc/init.d/network
+
+14.14 /etc/init.d/dropbear
+--------------------------
+Pedido por rcS. Debe:
+  - Generar host keys si no existen
+  - Lanzar dropbear como daemon
+
+Esqueleto:
+  #!/bin/sh
+  DBDIR=/etc/dropbear
+  mkdir -p "$DBDIR"
+  [ -f "$DBDIR/dropbear_rsa_host_key" ] || \
+    dropbearkey -t rsa -f "$DBDIR/dropbear_rsa_host_key" >/dev/null 2>&1
+  [ -f "$DBDIR/dropbear_ed25519_host_key" ] || \
+    dropbearkey -t ed25519 -f "$DBDIR/dropbear_ed25519_host_key" >/dev/null 2>&1
+  case "$1" in
+    start)
+      /usr/sbin/dropbear \
+        -r "$DBDIR/dropbear_rsa_host_key" \
+        -r "$DBDIR/dropbear_ed25519_host_key"
+      ;;
+    stop)
+      killall dropbear 2>/dev/null
+      ;;
+  esac
+
+  $ chmod +x $MLX_ROOTFS/etc/init.d/dropbear
+
+14.15 /var/www/index.html
+-------------------------
+Página servida por httpd. Querías que ayude a bajar archivos desde el
+MiniLinux. Ideas:
+
+[[escribilo con esta estructura]]
+  - Un título del sistema.
+  - Un link a /files/ (usa httpd auto-index si lo habilitaste; si no, un
+    listado manual).
+  - Descripción corta de qué es esta máquina.
+
+Ejemplo mínimo:
+
+  <!doctype html>
+  <html><head><title>MiniLinux</title></head>
+  <body>
+  <h1>MiniLinux file server</h1>
+  <p>Browse <a href="/files/">/files/</a> to download.</p>
+  </body></html>
+
+Y simbolicá /var/www/files -> /home/user o lo que quieras exponer:
+
+  $ ln -s /home/user $MLX_ROOTFS/var/www/files
+
+(busybox httpd sigue symlinks por default y lista el dir si no hay index.
+Si querés deshabilitar listado, mete un index.html en /home/user.)
+
+14.16 /root/.bashrc y /root/.profile
+------------------------------------
+Cuando root entra, bash lee /etc/profile y después ~/.bash_profile o
+~/.profile, y para shells interactivos ~/.bashrc.
+
+[[escribí un /root/.bashrc mínimo]]
+  - Debe incluir /etc/profile (source /etc/profile).
+  - Puede sumar aliases propios, historial, etc.
+
+Y lo mismo para /home/user/ (pero con permisos del user, no root; chmod
+después).
+
+
+================================================================================
+  PARTE 15 - EMPAQUETAR EL INITRAMFS
+================================================================================
+
+15.1 Permisos y ownership
+-------------------------
+Un detalle importante: los archivos del rootfs deberían tener owner root:root
+cuando entran al cpio, salvo /home/user que debe ser 1000:1000.
+
+Como vos estás construyendo como usuario normal, no pueden quedar con owner
+root. Dos opciones:
+
+(a) Empaquetar con sudo (más simple):
+    $ cd $MLX_ROOTFS
+    $ sudo chown -R root:root .
+    $ sudo chown -R 1000:1000 home/user
+    (empaquetás, después devuelve el owner a tu user si querés)
+
+(b) Usar fakeroot (no requiere sudo):
+    $ sudo apt install fakeroot
+    $ cd $MLX_ROOTFS
+    $ fakeroot -- sh -c '
+        chown -R root:root .
+        chown -R 1000:1000 home/user
+        find . | cpio -H newc -o | xz --check=crc32 -9e > ../iso/isolinux/rootfs.cpio.xz
+      '
+
+15.2 Empaquetar
+---------------
+Opción (a) manual:
+
+  $ cd $MLX_ROOTFS
+  $ sudo find . | sudo cpio -H newc -o | xz --check=crc32 -9e > ../iso/isolinux/rootfs.cpio.xz
+
+[concepto cpio]
+  cpio -H newc es el formato "newc" (SVR4). Es el que entiende el kernel
+  para initramfs. -o (output) crea el archivo desde stdin.
+
+[concepto xz check=crc32]
+  El kernel sabe leer xz con check=crc32 (ahorro de ~12 bytes por bloque).
+  check=crc64 o sha256 pueden romper si el kernel no se compiló con esos.
+  -9e es compresión máxima.
+
+[checkpoint]
+  $ ls -lh $MLX_ISO/isolinux/rootfs.cpio.xz
+  Debería estar entre 3 y 10 MB según qué incluyas.
+
+
+================================================================================
+  PARTE 16 - ISOLINUX: BOOTLOADER DEL ISO
+================================================================================
+
+16.1 Copiar los binarios de ISOLINUX
+------------------------------------
+  $ cp /usr/lib/ISOLINUX/isolinux.bin $MLX_ISO/isolinux/
+  $ cp /usr/lib/syslinux/modules/bios/ldlinux.c32   $MLX_ISO/isolinux/
+  $ cp /usr/lib/syslinux/modules/bios/libutil.c32   $MLX_ISO/isolinux/
+  $ cp /usr/lib/syslinux/modules/bios/libcom32.c32  $MLX_ISO/isolinux/
+  $ cp /usr/lib/syslinux/modules/bios/menu.c32      $MLX_ISO/isolinux/
+
+16.2 isolinux.cfg (escribilo vos)
+---------------------------------
+Es tu menu de boot. Formato similar al syslinux.cfg del floppy.
+
+Estructura esperada:
+  - UI menu.c32 (menú visual)
+  - PROMPT 0  (no muestra prompt, va directo al menú)
+  - TIMEOUT 50  (tiempo en décimas: 5 segundos)
+  - DEFAULT minilinux
+
+  - Un LABEL por entrada. Cada entrada:
+      LABEL nombre
+      MENU LABEL Texto visible
+      KERNEL isolinux/bzImage
+      INITRD isolinux/rootfs.cpio.xz
+      APPEND rdinit=/sbin/init console=tty0 console=ttyS0,115200 quiet
+
+[[escribí vos isolinux.cfg con al menos dos entradas]]
+  - "Normal": como arriba.
+  - "Debug": sin 'quiet', con 'loglevel=8' y 'earlyprintk=serial,ttyS0,115200'.
+
+16.3 Armar el ISO
+-----------------
+  $ cd $MLX_BUILD
+  $ xorriso -as mkisofs \
+      -o minilinux.iso \
+      -V "MINILINUX_2_0" \
+      -J -R \
+      -c isolinux/boot.cat \
+      -b isolinux/isolinux.bin \
+      -no-emul-boot -boot-load-size 4 -boot-info-table \
+      iso/
+
+  $ isohybrid minilinux.iso
+
+[concepto flags xorriso]
+  -V: label del volumen.
+  -J: Joliet (nombres largos para Windows).
+  -R: Rock Ridge (nombres largos y perms Unix).
+  -c: catálogo El Torito (lo crea).
+  -b: boot image.
+  -no-emul-boot: tratarlo como "no floppy emulation".
+  -boot-load-size 4: 4 sectores de 512 B = 2 KB cargados.
+  -boot-info-table: parchea el boot image con offsets. isolinux lo requiere.
+
+[concepto isohybrid]
+  Parchea el ISO para que también sea un disco con MBR. Así podés dd-earlo
+  a un pendrive y bootear en una PC real.
+
+
+================================================================================
+  PARTE 17 - PROBAR EN QEMU
+================================================================================
+
+17.1 Boot rápido con floppy-like
+---------------------------------
+  $ qemu-system-i386 -cdrom $MLX_BUILD/minilinux.iso -m 128 \
+      -netdev user,id=n0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:80 \
+      -device e1000,netdev=n0
+
+[concepto hostfwd]
+  Expone puertos del guest en localhost del host. tcp::2222-:22 = el 2222
+  del host apunta al 22 del guest. Así, desde el host:
+    $ ssh -p 2222 user@localhost
+    $ curl http://localhost:8080
+
+17.2 Boot con serial para debug
+--------------------------------
+  $ qemu-system-i386 -cdrom minilinux.iso -m 128 -nographic
+
+En el menú de ISOLINUX, seleccionás la entrada "Debug". Verás kernel log
+completo por el stdio.
+
+
+================================================================================
+  PARTE 18 - INSTALAR EN UN HDD EXT4 (persistencia)
+================================================================================
+
+Una vez funcionando desde ISO, podés "instalar" el MiniLinux en un disco
+ext4 real. La idea: copiás el rootfs desenpaquetado a una partición y
+configurás un bootloader que cargue kernel + initramfs desde ahí, O
+directamente arrancás sin initramfs (root en ext4).
+
+Opción simple: SEGUÍ usando initramfs, pero poné kernel + initramfs en la
+partición ext4 y configurá extlinux para cargarlos. Es la vía más corta.
+
+Opción "pura": compilás el kernel con EXT4 built-in (ya lo hicimos),
+sacás el initramfs y le pasás  root=/dev/sdaX rootfstype=ext4 .
+Vas a necesitar un /sbin/init real en el disco y una estructura FHS en disco.
+
+Dejo la receta detallada para la segunda fase, una vez tengas la ISO viva.
+
+
+================================================================================
+  APÉNDICE A - SCRIPTS DE BUILD QUE PODÉS AUTOMATIZAR DESPUÉS
+================================================================================
+
+Cuando ya entiendas el proceso, armar un script que compile todo es útil
+para iterar. Estructura típica:
+
+  build.sh
+    source env.sh
+    build_kernel()       { ... }
+    build_busybox()      { ... }
+    build_ncurses()      { ... }
+    build_bash()         { ... }
+    ...
+    pack_initramfs()     { ... }
+    make_iso()           { ... }
+
+    case "$1" in
+      all) build_kernel && build_busybox && ... ;;
+      kernel) build_kernel ;;
+      iso) pack_initramfs && make_iso ;;
+      clean) rm -rf $MLX_BUILD/staging/* $MLX_ROOTFS ;;
+    esac
+
+Ventajas:
+  - Rebuildeás un solo paquete con "./build.sh bash".
+  - La función de empaquetado siempre es la misma.
+  - Compartís el laburo con otros.
+
+Pero NO lo escribas antes de haber hecho cada paso a mano al menos una vez.
+Cada paquete tiene una sorpresa, y si tu build.sh falla en el paso 7,
+querés saber qué hace cada paso para debugearlo.
+
+
+================================================================================
+  APÉNDICE B - DEBUG RÁPIDO DE KERNEL PANIC
+================================================================================
+
+Si bootea y hay panic, patrones comunes:
+
+  "Unable to mount root fs on unknown-block"
+    -> El kernel no está encontrando el rootfs. Probá:
+       - APPEND sin "root=" y con "rdinit=/sbin/init" (initramfs puro).
+       - Verificá que el initrd se cargó (log del kernel lo dice).
+
+  "Attempted to kill init"
+    -> Tu rcS o init murió. Buscá qué comando faltaba: suele ser un
+       binario no instalado al que init intentó exec.
+
+  Pantalla negra sin mensajes
+    -> Falta console=tty0 o consola serial. Agregá ambas.
+    -> O faltaron los nodos /dev/console (devtmpfs lo soluciona).
+
+  "No init found"
+    -> /sbin/init no existe o no es ejecutable. Verificá que busybox
+       install haya creado el symlink.
+
+Para ver todo lo que el kernel imprime: agregá en el APPEND:
+  loglevel=8 earlyprintk=serial,ttyS0,115200 debug
+
+
+================================================================================
+  FIN DE LA GUÍA
+================================================================================
+
+Próximos pasos después de que tengas una ISO vivita:
+  1. Agregar un script en /etc/init.d/ que muestre la IP al terminar el boot.
+  2. Pulir el menú ISOLINUX con splash ASCII.
+  3. Hacer un "install-to-disk.sh" que escriba a /dev/sdX un rootfs ext4.
+  4. Experimentar: agregar/quitar paquetes y ver qué rompe.
+
+Cuando trabés en algún paso, el patrón de debug es siempre:
+  - ¿El binario existe?
+  - ¿Es ejecutable (chmod +x)?
+  - ¿Es del arquitectura correcta (file nombre)?
+  - ¿Está statically linked (ldd dice "not a dynamic executable")?
+  - ¿Los archivos de datos que usa están donde los busca?

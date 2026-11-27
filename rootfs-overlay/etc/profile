@@ -1,0 +1,54 @@
+#!/bin/sh
+# Este es el script de login global. Se ejecuta cuando un shell entra en modo login.
+# Define un entorno base comun para todos los usuarios, antes de que se lean sus propios archivos de configuracion.
+
+# 1) Setear el PATH (donde se van a ir a buscar los binarios cuando se lanza un comando)
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
+export TERMINFO=/usr/share/terminfo
+
+# 2) Setear HOME (con fallback a root)
+export HOME=${HOME:-/root}
+
+# 3) TERM (identificador del tipo de terminal utilizado)
+export TERM=${TERM:-linux}
+case "$TERM" in
+    linux) export TERM=linux-256color ;;
+esac
+
+# 4) PS1 (Prompt String 1): prompt base PORTABLE (sh + bash), sin colores.
+#    Los colores y el estilo dieter van en los ~/.bashrc individuales
+#    porque requieren \[ \] para readline y eso ash no lo entiende.
+export PS1='\u@\h:\w\$ '
+
+# 5) EDITOR predeterminado (usado por sudo, git, crontab, etc.)
+export EDITOR=nano
+
+# 6) umask: restricción de permisos por default al crear archivos/dirs.
+#    022 -> archivos 644 (rw-r--r--), directorios 755 (rwxr-xr-x).
+#    Es el default estándar de todas las distros.
+umask 022
+
+# 7) Aliases del sistema (cada usuario tiene los suyos propios en .bashrc
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
+alias ll='ls -lah --color=auto'
+alias la='ls -A --color=auto'
+alias l='ls -CF --color=auto'
+alias cls='clear'
+
+# 8) Solo para shells interactivos: cosas de bienvenida y sourcing extra.
+case "$-" in
+    *i*) ;;              # interactivo, seguir
+    *) return 0 ;;       # no interactivo, cortar aca
+esac
+
+# Cargar scripts de /etc/profile.d/ si existe el dir.
+if [ -d /etc/profile.d ]; then
+    for sh in /etc/profile.d/*.sh; do
+        [ -r "$sh" ] && . "$sh"
+    done
+    unset sh
+fi
+
+
+

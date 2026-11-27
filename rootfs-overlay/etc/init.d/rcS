@@ -1,0 +1,58 @@
+#!/bin/sh
+# rcS - sysinit de MiniLinux 2.0
+# Corre una sola vez al arrancar, antes de getty.
+# Debe terminar: nada en foreground indefinido.
+
+# PATH explicito: rcS lo lanza init directamente, no un shell de login,
+# asi que /etc/profile todavia no corrio. Dejamos un PATH defensivo
+# para encontrar cualquier applet de busybox sin ruta absoluta.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+# Filesystems virtuales del kernel.  El primero contiene archivos con info del kernel y el segundo se usa para dispositivos y buses
+# (lo usa mdev para crear archivos en /dev)
+
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+
+# Asegurarse que /dev tiene devtmpfs. El kernel lo monta solo si
+#    DEVTMPFS_MOUNT=y, pero por las dudas chequeamos.
+mountpoint -q /dev || mount -t devtmpfs devtmpfs /dev
+
+# devpts para pseudoterminales (ssh, su, screen, etc.)
+[ -d /dev/pts ] || mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+
+# tmpfs para scratch (/tmp) y runtime data (/run).
+mount -t tmpfs tmpfs /tmp
+mount -t tmpfs tmpfs /run
+
+# Registrar mdev como handler de hotplug del kernel.
+echo /sbin/mdev > /proc/sys/kernel/hotplug
+
+# Escanear dispositivos ya presentes y aplicar reglas de mdev.
+mdev -s
+
+# Cargar hostname
+hostname -F /etc/hostname
+
+# Levantar la interfaz loopback. Necesaria para que los procesos
+#    locales puedan hablar por TCP/IP sobre 127.0.0.1.
+ifconfig lo 127.0.0.1 netmask 255.0.0.0 up
+
+# Red: levantar eth0, pedir DHCP, configurar resolv.conf.
+/etc/init.d/network  start >/dev/null 2>&1 &
+
+# SSH: generar host keys si no existen, lanzar dropbear.
+/etc/init.d/dropbear start >/dev/null 2>&1 &
+
+# Cargar fuente Monocraft en la consola (solo aplica a tty con
+#     framebuffer; en ttyS0 falla silenciosamente, es normal).
+# Cargar fuente Monocraft SOLO si hay framebuffer activo.
+# Sin fbcon, setfont sobre vga_con texto no tiene efecto.
+# Ver PENDING.txt punto 1 para contexto.
+[ -e /dev/fb0 ] && setfont /usr/share/consolefonts/monocraft-7x16.psf
+
+
+
+

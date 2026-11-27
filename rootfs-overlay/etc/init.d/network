@@ -1,0 +1,29 @@
+#!/bin/sh
+# /etc/init.d/network - levantar/bajar eth0 con DHCP.
+# Invocado desde rcS (start) y rcK (stop).
+
+IFACE=eth0
+
+case "$1" in
+    start)
+        # Levantar la NIC.
+        ifconfig "$IFACE" up
+        # Pedir lease DHCP. -b daemoniza tras recibirlo, -q se rinde si no
+        # hay server, -S loguea al syslog, -t 5 intenta 5 veces.
+        udhcpc -i "$IFACE" -b -q -S -t 5 >/dev/null 2>&1
+        ;;
+    stop)
+        # Matar el udhcpc daemonizado (si existe) y bajar la interfaz.
+        killall udhcpc 2>/dev/null
+        ifconfig "$IFACE" down 2>/dev/null
+        ;;
+    restart)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    *)
+        echo "uso: $0 {start|stop|restart}" >&2
+        exit 1
+        ;;
+esac

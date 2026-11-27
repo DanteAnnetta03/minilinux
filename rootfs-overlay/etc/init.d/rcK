@@ -1,0 +1,29 @@
+#!/bin/sh
+# /etc/init.d/rcK - shutdown de MiniLinux 2.0.
+# Invocado por init via la action 'shutdown' del inittab, antes de
+# apagar/reiniciar el kernel.
+
+echo ""
+echo "Deteniendo servicios..."
+
+# 1) Matar daemons de red. 2>/dev/null por si no estan corriendo.
+killall dropbear  2>/dev/null
+killall udhcpc    2>/dev/null
+killall httpd     2>/dev/null
+
+# Pequena pausa para que terminen limpio.
+sleep 1
+
+# 2) Flush de buffers del kernel a disco.
+#    En initramfs puro no importa; critico si hay fs persistente montado.
+echo "Sincronizando buffers..."
+sync
+
+# 3) Desmontar todo lo desmontable. Lo que no se pueda, remontar RO con -r.
+#    Evita corrupcion de fs reales si el kernel se apaga con dirty state.
+echo "Desmontando filesystems..."
+umount -a -r 2>/dev/null
+
+sync
+
+echo "OK."

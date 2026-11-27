@@ -1,0 +1,39 @@
+# /etc/inittab - config de busybox init.
+# Formato: <id>:<runlevels>:<action>:<process>
+#   id:        tty a usar (vacio = /dev/console). Sin "/dev/" prefix.
+#   runlevels: IGNORADO por busybox.
+#   action:    sysinit | respawn | wait | once | ctrlaltdel | shutdown | restart | askfirst
+#   process:   ruta absoluta + args.
+
+# === Sistema arriba ===
+
+# sysinit: corre una vez al arrancar, antes de cualquier getty.
+# init espera a que rcS termine.
+::sysinit:/etc/init.d/rcS
+
+# === Consolas ===
+
+# tty1: consola fisica (lo que ves en QEMU grafico o pantalla real).
+# Si getty muere (ej: user hace logout), init lo vuelve a lanzar.
+tty1::respawn:/sbin/getty -L tty1 38400 linux
+tty2::respawn:/sbin/getty -L tty2 38400 linux
+tty3::respawn:/sbin/getty -L tty3 38400 linux
+tty4::respawn:/sbin/getty -L tty4 38400 linux
+#tty5::respawn:/sbin/getty -L tty5 38400 linux
+#tty6::respawn:/sbin/getty -L tty6 38400 linux
+#tty7::respawn:/sbin/getty -L tty7 38400 linux
+
+# ttyS0: consola por puerto serie. Util para debug en QEMU -nographic
+# o en un cable serial a una PC real. baud 115200, TERM=vt100.
+ttyS0::respawn:/sbin/getty -L ttyS0 115200 vt100
+
+# === Senales ===
+
+# Ctrl+Alt+Del en consola: reboot limpio.
+::ctrlaltdel:/sbin/reboot
+
+# Shutdown: corre antes de halt/reboot. Mata daemons y desmonta.
+::shutdown:/etc/init.d/rcK
+
+# SIGHUP a init: re-leer este archivo.
+::restart:/sbin/init

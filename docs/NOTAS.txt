@@ -1,0 +1,171 @@
+===============================================================================
+  MiniLinux (floppinux fork) - Notas de diagnóstico y roadmap 2.0
+  Fecha: 2026-11-25
+===============================================================================
+
+-------------------------------------------------------------------------------
+1. DIAGNÓSTICO DEL "KERNEL PANIC"
+-------------------------------------------------------------------------------
+
+Estado real: la imagen /home/dante/mini_linux/minilinux.img ARRANCA BIEN.
+Verificado con:
+
+    qemu-system-i386 -fda /home/dante/mini_linux/minilinux.img
+
+Se llega al prompt de BusyBox (ash) sin panic.
+
+Por lo tanto el kernel, el initrd (rootfs.cpio.xz) y SYSLINUX están OK.
+El "panic" que veías viene de la invocación de QEMU, no de la imagen.
+
+Causas más probables (en orden de probabilidad):
+
+  a) Usabas `qemu-system-x86_64` en lugar de `qemu-system-i386`.
+     El kernel está compilado como CONFIG_X86_32=y / CONFIG_M486=y /
+     sin SMP, así que arranca más "limpio" en el target de 32 bits.
+
+  b) Poca RAM. El init_size del bzImage 6.14 es ~0x3bb000 (≈ 60 MB sólo
+     para descomprimir). Si pasabas `-m 8` o `-m 16` el kernel panic
+     ocurre durante la descompresión. Usa `-m 128` o más.
+
+  c) Arranque desde el medio equivocado: `-hda`/`-cdrom` en vez de `-fda`.
+     SeaBIOS entonces falla ("Boot failed: could not read the boot disk").
+
+  d) `-nographic` sin cambiar `console=` en la cmdline. El kernel
+     actual NO tiene CONFIG_SERIAL_8250, así que no verás nada por
+     serie y parece colgado. Para ver salida por ttyS0 habría que
+     recompilar el kernel con SERIAL_8250 habilitado.
+
+Observaciones menores en el proyecto:
+
+  - /home/dante/mini_linux/syslinux.cfg tiene DOS directivas DEFAULT
+    (floppinux y minilinux). SYSLINUX se queda con la última; conviene
+    dejar un solo DEFAULT para evitar confusiones.
+
+  - /home/dante/mini_linux/filesystem/etc/init.d/rc monta /dev/fd0
+    como msdos. Eso sólo funciona si arrancas con `-fda`. Si en el
+    futuro empaquetas el rootfs en otro medio, el mount fallará
+    (pero no causa panic, sólo un error de init).
+
+Comando de prueba recomendado:
+
+    qemu-system-i386 -fda /home/dante/mini_linux/minilinux.img -m 128
+
+Para capturar la pantalla real del panic (sin serial 8250 en el kernel):
+
+    (sleep 10; echo "screendump /tmp/panic.ppm"; echo quit) | \
+        qemu-system-i386 -fda minilinux.img -monitor stdio -display none
+
+
+-------------------------------------------------------------------------------
+2. ROADMAP 2.0 - FACTIBILIDAD DE NUEVAS FEATURES
+-------------------------------------------------------------------------------
+
+Resumen: todo es técnicamente viable, pero se abandona el "cabe en un
+diskette de 1.44 MB". Habría que pasar a CD-ROM/USB/ISO (iso9660 o
+ext2/ext4) y probablemente a una toolchain glibc o musl más amplia que
+el cross i486-musl actual.
+
+Escala orientativa (comprimido, estimaciones de orden de magnitud):
+
+  bash estático .................... ~1 MB   (BusyBox ash ya ocupa ~290 KB)
+  nano + ncurses ................... ~400 KB
+  GCC + binutils + headers ......... 40-80 MB  (es el elefante)
+  tcc (Tiny C Compiler) ............ ~200 KB   (alternativa realista a GCC)
+  colores en terminal .............. 0 MB extra (ver más abajo)
+  httpd (busybox) .................. 0 MB extra (ya viene en busybox)
+  telnetd/telnet (busybox) ......... 0 MB extra (ya viene en busybox)
+  dropbear (SSH) ................... ~400 KB   (opcional, mejor que telnet)
+
+Desglose por feature:
+
+  [FÁCIL] Colores en la terminal
+    - El kernel ya tiene CONFIG_VT=y. Falta sólo:
+        * exportar TERM=linux  en el init
+        * copiar /etc/terminfo/l/linux (de ncurses-base) al rootfs,
+          o usar busybox con tput/aliases.
+        * alias ls='ls --color=auto', alias grep='grep --color=auto'
+          (el ls de busybox soporta --color).
+    - Costo: minutos. No cambia nada del kernel.
+
+  [FÁCIL] bash
+    - Recompilar bash estático con el cross musl i486 actual:
+        ./configure --host=i486-linux-musl --enable-static-link \
+                    --without-bash-malloc
+        make
+    - Sustituir el symlink /bin/sh y añadir /bin/bash.
+    - Costo: 1 build. El binario pesa ~1 MB (quita módulos no usados
+      con --disable-* para bajarlo).
+
+  [FÁCIL] httpd + telnetd + netcat
+    - BusyBox ya trae httpd, telnetd, nc, wget, ftpget, tftp, udhcpc.
+      Sólo hay que habilitarlos en busybox config y rebuildear.
+    - Hay que activar en el kernel:
+        CONFIG_NET=y
+        CONFIG_INET=y
+        CONFIG_PACKET=y
+        CONFIG_UNIX=y
+        driver NIC de QEMU: CONFIG_E1000=y  (o VIRTIO_NET)
+    - En el init: ifconfig eth0 up / udhcpc -i eth0
+    - telnetd escucha con:  telnetd -l /bin/sh
+      (PELIGROSO en red real; para QEMU está OK)
+    - httpd sirve con:      httpd -h /var/www
+    - Costo: rebuild de kernel (para red + driver) + rebuild busybox.
+      La imagen crece poco (~50-100 KB).
+
+  [MEDIO] nano
+    - Necesita ncurses. Hay que cross-compilar:
+        1) ncurses  (--host=i486-linux-musl --with-termlib --enable-static)
+        2) nano     (--host=... --enable-tiny para versión mínima)
+    - Instalar /usr/share/terminfo (o sólo linux/xterm para ahorrar).
+    - Costo: 2 builds, ~400-800 KB en el rootfs. Nada en el kernel.
+
+  [MEDIO] SSH (dropbear)
+    - Preferible a telnet. Cross-compilar dropbear estático
+      (--disable-zlib para no depender de zlib, o compilar zlib antes).
+    - Generar host keys al primer arranque desde el init.
+    - Costo: 1-2 builds, ~400 KB.
+
+  [DIFÍCIL] GCC nativo en la imagen
+    - Toolchain glibc o musl completa + binutils + headers del kernel +
+      libc. Pesa decenas de MB incluso minimizado.
+    - Opciones realistas:
+        * tcc (Tiny C Compiler): ~200 KB, compila C89/C99 básico, ideal
+          para "demostrar que se puede compilar hola mundo en la imagen".
+        * cproc + QBE: alternativo moderno, también pequeño.
+        * GCC completo sólo si ya saltaste a ISO/USB (ya no cabe en
+          floppy, obviamente).
+    - Si el objetivo es "editar y compilar algo desde el propio sistema",
+      tcc + nano es la combinación que mejor costo/beneficio tiene.
+
+-------------------------------------------------------------------------------
+3. RECOMENDACIÓN PARA LA 2.0
+-------------------------------------------------------------------------------
+
+Fases sugeridas, de menor a mayor fricción:
+
+  Fase 1 (sigue cabiendo en floppy o cerca):
+    - Colores en terminal (TERM + aliases).
+    - Habilitar en busybox: httpd, telnetd, nc, udhcpc, vi mejorado.
+    - Activar red en el kernel (E1000 o virtio-net).
+    - Añadir /etc/init.d/rc.net para levantar eth0.
+
+  Fase 2 (deja atrás el diskette, mejor ISO o imagen de 10-20 MB):
+    - bash estático como /bin/sh.
+    - nano + ncurses mínimo.
+    - dropbear en lugar de telnet.
+    - tcc como compilador on-board.
+
+  Fase 3 (opcional, "distro de verdad"):
+    - GCC + binutils + musl headers.
+    - Gestor de paquetes mínimo (opkg o scripts propios).
+    - Pasar a initramfs + rootfs persistente en ext4.
+
+Para probar red en QEMU sin tocar la red real:
+
+    qemu-system-i386 -fda minilinux.img -m 128 \
+        -netdev user,id=n0,hostfwd=tcp::2323-:23,hostfwd=tcp::8080-:80 \
+        -device e1000,netdev=n0
+
+Y desde el host:   telnet localhost 2323   /   curl localhost:8080
+
+===============================================================================

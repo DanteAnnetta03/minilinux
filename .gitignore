@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+minilinux.iso
+
+# Toolchain binario (lo baja el que reconstruya)
+i486-linux-musl-cross/
+i486-linux-musl-*.tgz
+i486-linux-musl-*.tar.*
+
+# Archivos del proyecto antiguo (floppinux v1)
+archive/
+
+# Fuentes bajadas (hay que bajarlas, no versionarlas)
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tgz
+
+# Editores
+*.swp
+*~
+.DS_Store
+configs-mlx/

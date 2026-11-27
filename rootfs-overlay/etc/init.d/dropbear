@@ -1,0 +1,34 @@
+#!/bin/sh
+# /etc/init.d/dropbear - SSH server.
+# Invocado desde rcS (start) y rcK (stop).
+
+DBDIR=/etc/dropbear
+RSA_KEY="$DBDIR/dropbear_rsa_host_key"
+ED_KEY="$DBDIR/dropbear_ed25519_host_key"
+
+# Asegurar que el directorio existe (en initramfs vive en tmpfs tras el boot).
+mkdir -p "$DBDIR"
+
+# Generar host keys si no estan (primer boot las crea, los siguientes reusa).
+[ -f "$RSA_KEY" ] || dropbearkey -t rsa     -f "$RSA_KEY" >/dev/null 2>&1
+[ -f "$ED_KEY"  ] || dropbearkey -t ed25519 -f "$ED_KEY"  >/dev/null 2>&1
+
+case "$1" in
+    start)
+        # dropbear daemoniza solo por default. -r X -r Y registra dos host keys.
+        # Puerto default: 22. Para cambiarlo: -p 2222
+        /usr/sbin/dropbear -r "$RSA_KEY" -r "$ED_KEY"
+        ;;
+    stop)
+        killall dropbear 2>/dev/null
+        ;;
+    restart)
+        "$0" stop
+        sleep 1
+        "$0" start
+        ;;
+    *)
+        echo "uso: $0 {start|stop|restart}" >&2
+        exit 1
+        ;;
+esac
